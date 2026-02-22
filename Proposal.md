@@ -3,6 +3,9 @@
 ## 1. 提案 (Proposal)
 
 ### 中文版：Zuzalu Library AI 启航计划 —— 赋能数字个体的 AI 生存与进化指南
+**目标受众**
+1. 人在清迈长居，有一个月时间，能够参与线下课程的同学。
+2. 非AI从业人员，听过AI，但应用不多，希望提升AI水平的人群
 
 **核心理念**：
 在 AI 席卷全球职场与组织的当下，拥抱 AI 不再是选项，而是必然。Zuzaulu Library与Aura AI组织了这次课程， 致力于打破认知隔阂，通过“边学、边建、边教”的循环模式，
@@ -22,11 +25,16 @@
 
 ---
 
-### English Version: Aura AI Genesis — AI Empowerment & Evolution Guide for Digital Citizens
+### English Version: Zuzalu Library AI Genesis — AI Empowerment & Evolution Guide for Digital Citizens
 
 **Vision**:
 As AI reshapes every social role and organization, proactive adaptation is the only path forward. Zuzalu Library and Aura AI orgnize this course 
 to empower digital nomads and the wider community by bridging the gap between cutting-edge technology and everyday application.
+
+**Target Audience / Who Should Join**
+Chiang Mai Locals & Long-term Residents: Individuals currently based in Chiang Mai who can commit to a one-month hybrid/offline curriculum.
+
+AI Enthusiasts & Non-Professionals: Those who are aware of AI but haven't fully integrated it into their workflow yet, and are looking to systematically level up their AI capabilities.
 
 **Core Objectives**:
 
