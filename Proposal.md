@@ -92,7 +92,8 @@ AI Enthusiasts & Non-Professionals: Those who are aware of AI but haven't fully 
 
 * 您是否愿意在学习后，尝试作为志愿者将所学分享/教给更多人？
 
-
+根据调研和访谈，Zuzalu library和AuraAI一起确定课程时间、侧重点和日程。
+目前初步确定每周两次（相同课程中英文各一次），然后每次时间55分钟+10分钟break+55分钟，需要自带笔记本。
 ## Team
 Cherry, CFCZ, Jason, Oscar and more
 
