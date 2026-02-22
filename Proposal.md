@@ -92,10 +92,9 @@ AI Enthusiasts & Non-Professionals: Those who are aware of AI but haven't fully 
 
 * 您是否愿意在学习后，尝试作为志愿者将所学分享/教给更多人？
 
----
 
-## 下一步建议
+## Team
+Cherry, CFCZ, Jason, Oscar and more
 
-1. **海报设计**：我可以为您生成一张**赛博朋克+社区温情风格**的海报草图，或者提供详细的设计提示词（Prompt）供您在 Midjourney 中使用。
-2. **Grant 申请细化**：如果需要向四海或 Zuzalu 申请具体的 Grant，我们可以针对他们的评审偏好（如：Public Goods, Decentralization）再优化一下措辞。
+
 
