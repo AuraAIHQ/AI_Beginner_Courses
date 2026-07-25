@@ -62,6 +62,8 @@ export function callbackBody(evt: LifecycleEvent): string {
     ...(typeof evt.costUsd === "number" ? { costUsd: evt.costUsd } : {}),
     ...(typeof evt.inputTokens === "number" ? { inputTokens: evt.inputTokens } : {}),
     ...(typeof evt.outputTokens === "number" ? { outputTokens: evt.outputTokens } : {}),
+    // 分节成本明细(每步花多少/积分/卡点),失败也带 —— durable 送达前端,不受容器回收影响。
+    ...(evt.phases && evt.phases.length ? { phases: evt.phases } : {}),
     id: idempotencyKey(evt),
   });
 }

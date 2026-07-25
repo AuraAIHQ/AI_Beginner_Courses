@@ -20,6 +20,9 @@ export interface PersistedStatus {
   appUrl?: string;
   error?: string;
   updatedAt: string;
+  /** 累计用量 + 分节明细(供重启后 /status 仍显示成本/每步花费;结构对齐 server 的 Usage/PhaseUsage)。 */
+  usage?: { inputTokens: number; outputTokens: number; costUsd: number };
+  phases?: Array<{ stage: string; costUsd: number; inputTokens: number; outputTokens: number; credits: number }>;
 }
 
 /** 把状态快照写入 specDir/.loop/status.json（原子:先写临时再 rename）。 */
