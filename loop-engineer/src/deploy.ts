@@ -85,8 +85,10 @@ const SELF_DEPLOY_HINT =
   "`npx wrangler pages deploy . --project-name=<你起的名>`。我方这份托管 7 天后自动删除。";
 
 // 常见静态产物目录(按站点优先级);build 后在此列表里找可部署目录。
-// .vercel/output/static = @cloudflare/next-on-pages / Vercel 静态导出;out = Next `output:export`;dist = Vite/Astro;build = CRA。
-const OUTPUT_DIRS = ["out", "dist", "build", ".vercel/output/static", "public"];
+// .vercel/output/static = @cloudflare/next-on-pages 适配产物;out = Next `output:export`;dist = Vite/Astro;build = CRA。
+// 注意:不含 `public` —— 那是 Next.js/CRA 的静态资产源目录(favicon 等),不是构建产物,
+// 误当产物部署会得到无 index.html 的 404 页(flight-monitor 实测)。
+const OUTPUT_DIRS = ["out", "dist", "build", ".vercel/output/static"];
 
 async function pathExists(p: string): Promise<boolean> {
   return fs.access(p).then(() => true).catch(() => false);
@@ -150,18 +152,44 @@ export async function buildIfNeeded(dir: string): Promise<BuildOutcome> {
         : ["install", "--production=false"];
   log.step(`部署前构建(${pm}):${dir}`);
   await pexec(pm, installArgs, opts);
-  await pexec(pm, ["run", "build"], opts);
 
+  // Next.js:默认 `next build` 只产 .next(SSR,非静态,CF Pages 部署不了)。用官方
+  // @cloudflare/next-on-pages 适配成 CF Pages 兼容产物(.vercel/output/static + Functions)。
+  // 它内部自己跑 next build,故此分支不另跑 `run build`。适配失败(常见:动态/API 路由未声明
+  // edge runtime)→ 回退给可读 note,不强行部署坏产物。
+  const isNext = !!(pkg.dependencies?.next || pkg.devDependencies?.next);
+  if (isNext) {
+    try {
+      log.step("Next.js → @cloudflare/next-on-pages 适配 CF Pages");
+      await pexec("npx", ["--yes", "@cloudflare/next-on-pages@1"], { ...opts, timeout: 480_000 });
+    } catch (e) {
+      const msg = (e as Error).message.slice(0, 300);
+      log.warn(`next-on-pages 适配失败:${msg}`);
+      return {
+        deployDir: dir,
+        built: true,
+        note:
+          "Next.js 应用需 @cloudflare/next-on-pages 适配才能上 CF Pages,本次适配失败" +
+          "(常见:动态路由 / API 路由需声明 `export const runtime = 'edge'`,或改用 next.config 的 " +
+          `output:'export' 静态导出)。适配报错:${msg}`,
+      };
+    }
+    const nopOut = path.join(dir, ".vercel", "output", "static");
+    if (await pathExists(nopOut)) {
+      log.ok("Next.js 适配产物:.vercel/output/static");
+      return { deployDir: nopOut, built: true };
+    }
+    return { deployDir: dir, built: true, note: "next-on-pages 未产出 .vercel/output/static,回退部署源码目录(可能不可用)。" };
+  }
+
+  await pexec(pm, ["run", "build"], opts);
   const found = await findDeployableOutput(dir);
   if (found) {
     log.ok(`构建产物目录:${path.relative(dir, found)}`);
     return { deployDir: found, built: true };
   }
-  // 有 build 脚本但没找到静态产物 —— 大概率 Next.js 默认 SSR(只产 .next,非静态)。
-  const isNext = !!(pkg.dependencies?.next || pkg.devDependencies?.next);
-  const note = isNext
-    ? "检测到 Next.js 但未产出静态目录(out/)。SSR 应用需 next.config 设 output:'export' 静态导出,或用 @cloudflare/next-on-pages 适配;本次回退部署源码目录,可能不可用。"
-    : "build 完成但未找到 out/dist/build 等静态产物目录,回退部署源码目录。";
+  // 非-Next 框架:build 完成但没找到 out/dist/build 静态产物 → 回退部署源码目录 + 提示。
+  const note = "build 完成但未找到 out/dist/build 等静态产物目录,回退部署源码目录(可能不可用)。";
   log.warn(note);
   return { deployDir: dir, built: true, note };
 }
