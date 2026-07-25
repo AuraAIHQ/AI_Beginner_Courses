@@ -11,6 +11,7 @@
     "plan": "tsx src/cli.ts plan",
     "run": "tsx src/cli.ts run",
     "status": "tsx src/cli.ts status",
+    "test": "tsx --test src/*.test.ts",
     "serve": "tsx src/server.ts",
     "smoke": "bash scripts/smoke.sh",
     "typecheck": "tsc --noEmit"

@@ -7,7 +7,7 @@ export interface Usage {
   inputTokens: number;
   outputTokens: number;
   cacheReadTokens: number;
-  /** 成本估算（USD）：claude 用 SDK 报告值；openai-chat 用价表估 */
+  /** 成本估算（USD）：claude 用 SDK 报告值；远程 OpenAI-compatible 用价表估 */
   costUsd: number;
   /** 计算量代理：模型墙钟毫秒（"计算秒" = computeMs/1000） */
   computeMs: number;

@@ -1,0 +1,21 @@
+services:
+  fde-copilot:
+    build: .
+    ports:
+      - "${FDE_COPILOT_PORT:-3939}:3939"
+    environment:
+      NODE_ENV: production
+      # Persistent browser-login state used by the bundled Claude Agent SDK.
+      CLAUDE_CONFIG_DIR: /claude-config
+      # Docker Desktop reaches the LM Studio server running on the host through this name.
+      LMSTUDIO_BASE_URL: ${LMSTUDIO_BASE_URL:-http://host.docker.internal:1234/v1}
+      LMSTUDIO_MODEL: ${LMSTUDIO_MODEL:-qwen2.5-7b-instruct-mlx}
+      FDE_DEFAULT_PROVIDER: ${FDE_DEFAULT_PROVIDER:-claude}
+    volumes:
+      # Keep generated customer specifications and conversation state across rebuilds.
+      - ./clients:/app/clients
+      - claude-config:/claude-config
+    restart: unless-stopped
+
+volumes:
+  claude-config:

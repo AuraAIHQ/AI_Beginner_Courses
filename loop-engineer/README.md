@@ -19,8 +19,8 @@
 任务可用 `coderProvider` / `reviewerProvider` 覆盖为不同模型（per-task 路由，难任务派更强的）。
 
 **供应商两类**：
-- `anthropic-agentic`（`claude`/`glm`/`kimi`/`deepseek`）—— 起 `claude -p`，有文件/命令工具，**agentic coder 必须用这类**。
-- `openai-chat`（`hilinkup:<model>`）—— OpenAI 兼容网关单发调用，**一个 key 调 GLM/Kimi/DeepSeek/Qwen 等**，用于 reviewer/planner/回流（自动把 diff/规格喂进去）。如 `hilinkup:kimi-k2.7-code`、`hilinkup:deepseek-v4-pro`。HiLinkup 只有中国模型、无 Anthropic 端点，故**不能当 coder**（agentic 编码需 `claude -p` 或 codex）。
+- `anthropic-agentic`（`claude`/`glm`/`kimi`/`deepseek`）—— 起 `claude -p`，提供完整文件/命令工具。
+- `openai-compatible`（如 `hilinkup:<model>`、`lmstudio:<model>`）—— planner/reviewer 走标准 chat；只有声明 `agenticCoder` 能力的 Provider（当前为 LM Studio）才能作为 coder。HiLinkup 保持 chat-only。
 
 **两层评审**：内层（Kimi，快、便宜、PR 前本地挡明显错）+ 可选外层（DeepSeek，独立第二意见），双过才 merge。外层是接入完整 [PR-Daemon](../../PR-Daemon) 多轮 PK review 的接缝——见 [PLAN.md](./PLAN.md) 的 PR-Daemon 集成方案。
 
@@ -58,6 +58,18 @@ pnpm plan ../fde-copilot/clients/<客户> --repo /path/to/目标repo \
 pnpm run run            # 常驻；--once 只处理一个任务；--drain 清空待办后退出
 pnpm run status         # 看进度
 ```
+
+## LM Studio 本地模型
+
+启动 LM Studio Local Server（默认 `http://127.0.0.1:1234/v1`）并加载支持工具调用的模型，然后：
+
+```bash
+cp .env.example .env
+# 在 .env 中设置 LMSTUDIO_MODEL
+LOOP_PLANNER=lmstudio LOOP_CODER=lmstudio LOOP_REVIEWER=lmstudio pnpm run run
+```
+
+也可用 `lmstudio:<模型 id>` 逐角色指定，例如 `LOOP_CODER=lmstudio:qwen2.5-7b-instruct-mlx`。planner/reviewer 使用 OpenAI-compatible chat；coder 只获得限定在任务 worktree 内的读取、写入和目录浏览工具。模型完成编辑后，typecheck/test/build 等命令统一由 Loop 的质量闸按 `loop.json` 配置执行，不向本地模型暴露任意 shell。
 
 ## 安全与信任模型
 

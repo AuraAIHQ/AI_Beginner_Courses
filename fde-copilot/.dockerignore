@@ -1,9 +1,11 @@
 node_modules
 .next
 .env
+.env.local
 .env.*
 !.env.example
 clients
 *.log
 .git
+.DS_Store
 tsconfig.tsbuildinfo

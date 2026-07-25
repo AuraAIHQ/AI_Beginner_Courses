@@ -25,6 +25,29 @@ pnpm dev                    # http://localhost:3939
 
 打开页面 → 左栏建一个客户 → 中间说你的情况和诉求 → 右栏看规格实时生成 → 满意后 commit。
 
+### 模型 Provider
+
+每个项目可在网页右栏独立选择模型后端：
+
+- `Claude`：Claude Agent SDK，支持浏览器订阅登录与内建 WebSearch。
+- `LM Studio`：OpenAI-compatible 本地模型，通过受控的规格文件工具工作；不会访问项目目录外的文件，也不会声称已联网搜索。
+
+本机开发默认连接 `http://127.0.0.1:1234/v1`；Docker 默认连接 `http://host.docker.internal:1234/v1`。启动 LM Studio Local Server 并加载支持工具调用的模型后，刷新页面即可看到模型列表。
+
+## Docker 部署（Claude 浏览器登录）
+
+容器使用 Claude 订阅登录态，不需要 `ANTHROPIC_API_KEY`。首次登录会在终端显示授权链接；在宿主机浏览器完成登录后，凭证会保存到 Docker 命名卷，重建容器后仍会保留：
+
+```bash
+cd fde-copilot
+docker compose up --build -d
+docker compose exec fde-copilot claude auth login --claudeai
+```
+
+访问 `http://localhost:3939`。可用 `docker compose exec fde-copilot claude auth status` 检查登录状态。客户规格与会话状态会持久化在宿主机的 `clients/`；改端口可执行 `FDE_COPILOT_PORT=8080 docker compose up -d`。
+
+如果要公网暴露，请在反向代理层做 HTTPS 与认证。`WORKBENCH_TOKEN` 会要求每个 API 请求包含 `x-workbench-token`，当前网页不会自动附带该 header，因此不要只靠设置这个变量来保护公网入口。
+
 ## 安全模型
 
 客户输入原样进 prompt，故对 prompt injection 做了硬性约束（不靠"cwd 看起来隔离"）：
@@ -44,6 +67,10 @@ pnpm dev                    # http://localhost:3939
 |---|---|---|
 | `ANTHROPIC_API_KEY` | 空 | 留空则用订阅认证 |
 | `CLAUDE_MODEL` | 空 | 留空跟随 Claude Code 默认 |
+| `FDE_DEFAULT_PROVIDER` | `claude` | 新项目默认 Provider：`claude` / `lmstudio` |
+| `LMSTUDIO_BASE_URL` | `http://127.0.0.1:1234/v1` | LM Studio OpenAI-compatible 地址 |
+| `LMSTUDIO_MODEL` | 空 | 未在项目中指定时使用的本地模型 |
+| `LMSTUDIO_API_KEY` | 空 | LM Studio 开启 API Token 时填写 |
 | `AGENT_MAX_TURNS` | 40 | 每轮 agent 内部最大 turn 数 |
 | `AUTO_COMMIT` | false | 每轮自动 commit 客户目录 |
 | `AUTO_PUSH` | false | 自动 commit 时是否 push |

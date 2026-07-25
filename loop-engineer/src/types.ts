@@ -56,8 +56,6 @@ export type JobManifest = z.infer<typeof JobManifest>;
 
 // —— 运行时 ——
 
-export type ProviderName = "claude" | "glm" | "kimi" | "mock";
-
 export const Config = z.object({
   watchDirs: z.array(z.string()).default([]),
   pollIntervalMs: z.number().default(15000),

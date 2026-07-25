@@ -1,0 +1,9 @@
+packages:
+  - fde-copilot
+  - loop-engineer
+  - capability-packs
+
+allowBuilds:
+  esbuild: true
+  sharp: true
+  workerd: true

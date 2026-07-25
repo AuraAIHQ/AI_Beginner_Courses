@@ -58,7 +58,8 @@ button.ghost {
 }
 
 input,
-textarea {
+textarea,
+select {
   font: inherit;
   background: var(--bg);
   color: var(--text);
@@ -72,6 +73,18 @@ input:focus,
 textarea:focus {
   outline: none;
   border-color: var(--accent);
+}
+
+.model-picker {
+  display: grid;
+  grid-template-columns: auto minmax(140px, 1fr);
+  gap: 6px 8px;
+  align-items: center;
+  margin-top: 10px;
+}
+.model-picker label {
+  color: var(--muted);
+  font-size: 12px;
 }
 
 .shell {

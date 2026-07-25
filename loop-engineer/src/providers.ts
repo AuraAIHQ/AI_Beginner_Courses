@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import type { ResolvedProvider } from "./config.js";
+import { runLocalCodingAgent } from "./local-agent.js";
 import { ZERO, estimateCost, recordUsage } from "./usage.js";
 import type { Usage } from "./usage.js";
 
@@ -92,6 +93,31 @@ export async function runAgent(prompt: string, opts: RunAgentOpts): Promise<RunA
       ? await opts.mockHandler(prompt, opts.cwd)
       : "[mock] no handler";
     return { text, provider: "mock", usage: { ...ZERO, calls: 1 } };
+  }
+
+  if (provider.kind === "openai-compatible") {
+    if (!provider.capabilities.agenticCoder || !provider.baseUrl || !provider.model) {
+      throw new Error(`供应商 ${provider.name} 不支持 agentic coder`);
+    }
+    const local = await runLocalCodingAgent({
+      cwd: opts.cwd,
+      baseUrl: provider.baseUrl,
+      apiKey: provider.apiKey,
+      model: provider.model,
+      prompt,
+      maxTurns: opts.maxTurns,
+      timeoutMs: opts.timeoutMs,
+    });
+    const usage: Usage = {
+      inputTokens: local.inputTokens,
+      outputTokens: local.outputTokens,
+      cacheReadTokens: 0,
+      costUsd: 0,
+      computeMs: local.computeMs,
+      calls: 1,
+    };
+    await recordUsage(provider.name, usage, new Date().toISOString());
+    return { text: local.text, provider: provider.name, usage };
   }
 
   const maxTurns = opts.maxTurns ?? 60;
@@ -229,8 +255,10 @@ async function attemptChat(
   provider: ResolvedProvider,
   opts: { maxTokens?: number; timeoutMs?: number },
 ): Promise<RunAgentResult> {
-  if (!provider.baseUrl || !provider.apiKey || !provider.model) {
-    throw new Error(`runChat 需要 openai-chat 供应商（有 baseUrl/apiKey/model）：${provider.name}`);
+  // Union(LM Studio + CC-58): 云 chat provider 需 apiKey，但本地 LM Studio 无 key。
+  // 只强制 baseUrl/model；apiKey 缺失时 fetch 自动省略 authorization 头（见下）。
+  if (!provider.baseUrl || !provider.model) {
+    throw new Error(`runChat 需要 OpenAI-compatible 供应商（有 baseUrl/model）：${provider.name}`);
   }
   const timeoutMs = opts.timeoutMs ?? 180_000;
   const startedMs = Date.now();
@@ -246,7 +274,7 @@ async function attemptChat(
         method: "POST",
         headers: {
           "content-type": "application/json",
-          authorization: `Bearer ${provider.apiKey}`,
+          ...(provider.apiKey ? { authorization: `Bearer ${provider.apiKey}` } : {}),
         },
         body: JSON.stringify({
           model: provider.model,

@@ -1,11 +1,13 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
+import { projectDir, readConversation, readClient, readProjectState } from "./clients";
+import type { ConversationEntry, TurnResult, Usage } from "./types";
 import { z } from "zod";
 import { query, tool, createSdkMcpServer } from "@anthropic-ai/claude-agent-sdk";
 import type { CanUseTool } from "@anthropic-ai/claude-agent-sdk";
-import { projectDir, readConversation, readClient, readProjectState } from "./clients";
-import type { ConversationEntry, TurnResult, Usage } from "./types";
 import { ZERO_USAGE } from "./types";
+import { resolveProviderSelection } from "./providers/registry";
+import { specAgentProvider } from "./providers/spec-provider";
 
 /**
  * 执行模式（CC-58，与 loop-engineer 对齐）：`api`（默认，云 key）| `local`（显式 opt-in，
@@ -371,8 +373,17 @@ export async function runTurn(input: RunTurnInput): Promise<RunTurnOutput> {
   const client = await readClient(input.clientSlug);
   const project = await readProjectState(input.clientSlug, input.projectSlug);
 
-  // 快 chat「直连」快模型(默认,配了 HILINKUP_API_KEY 时):绕开 agent-sdk 子进程,~11s。
-  if (process.env.CHAT_FULL_SPEC !== "true" && process.env.HILINKUP_API_KEY && process.env.CHAT_DIRECT !== "false") {
+  // 多provider 选择（OURS）：项目可选 claude / lmstudio。
+  const selection = resolveProviderSelection(project?.model);
+
+  // 快 chat「直连」快模型(CC-61,默认;仅 claude provider):绕开 agent-sdk 子进程,~11s。
+  // 项目显式选 LM Studio 时尊重选择,走下面的 provider 抽象层,不劫持到 HiLinkup 直连。
+  if (
+    selection.provider === "claude" &&
+    process.env.CHAT_FULL_SPEC !== "true" &&
+    process.env.HILINKUP_API_KEY &&
+    process.env.CHAT_DIRECT !== "false"
+  ) {
     return runTurnDirect(input, { dir, history, client, project });
   }
 
@@ -385,7 +396,6 @@ export async function runTurn(input: RunTurnInput): Promise<RunTurnOutput> {
     version: "1.0.0",
     tools: [buildSubmitTool(sink)],
   });
-
   // 附件名客户可控：只取 basename，杜绝借文件名做路径穿越/误导 Read 越界
   const safeAttachments = (input.attachments ?? []).map((a) => path.basename(a)).filter(Boolean);
   const attachNote = safeAttachments.length
@@ -429,6 +439,19 @@ ${input.customerInput}${attachNote}
 
 ${taskBlock}`;
 
+  // LM Studio（OURS 多provider）：走 provider 抽象层（本地 OpenAI 兼容 agentic 生成 spec）。
+  if (selection.provider === "lmstudio") {
+    const lmMaxTurns = Number(process.env.AGENT_MAX_TURNS ?? (fastMode ? 4 : 40));
+    return specAgentProvider(selection).run({
+      root: dir,
+      system,
+      user: prompt,
+      model: selection.model,
+      maxTurns: lmMaxTurns,
+    });
+  }
+
+  // claude（默认）：CC-58 云化 agent-sdk 执行路径（resolveAgentEnv 强制云 auth + query 循环）。
   // 快 chat 只需模型 1 次调 submit_turn（给一点余量应对思考轮）；完整模式沿用大 maxTurns。
   const maxTurns = Number(process.env.AGENT_MAX_TURNS ?? (fastMode ? 4 : 40));
   const model = process.env.CLAUDE_MODEL || undefined;

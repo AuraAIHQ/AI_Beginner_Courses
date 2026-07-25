@@ -60,7 +60,7 @@ async function callPlanner(
   const planner = resolveProvider(providerName);
   const prompt = strict ? tpl + STRICT_JSON_HINT : tpl;
   let res;
-  if (planner.kind === "openai-chat") {
+  if (planner.capabilities.contextAccess === "inline") {
     // 单发 chat：无 Read 工具，自己把规格文档拼进去
     const docs = await readSpecDocs(specDir);
     res = await runChat(prompt, `## 规格文档\n\n${docs}`, { provider: planner, maxTokens: 8000 });

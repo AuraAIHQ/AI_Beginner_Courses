@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import type {
-  Client, ConversationEntry, ProjectState, TurnResult, Usage, DeliverableType,
+  Client, ConversationEntry, ProjectState, TurnResult, Usage, DeliverableType, ModelSelection, ProviderId,
 } from "@/lib/types";
 import { SPEC_DOCS, DELIVERABLE_TYPES } from "@/lib/types";
 
@@ -29,6 +29,7 @@ const STR = {
     missing: "还缺", specsEmpty: "规格文档会随对话实时生成", empty: "（空）",
     tokens: "tokens", cache: "缓存", computeSecs: "计算秒", roundsRefresh: "轮 · 每 3 分钟刷新",
     theWorkbench: "生成「{x}」的 workbench", collapse: "折叠", rounds: "轮", ready: "就绪",
+    provider: "模型后端", model: "模型", unavailable: "不可用",
     uploadSpec: "⬆ 上传 spec 构建", uploadTitle: "上传现成 spec · 一键构建",
     uSub: "上传一份 markdown 规格（或用当前 SPEC），loop-engineer 直接据此建 job 编码",
     uClient: "客户 slug", uProject: "项目 slug", uRepo: "目标仓库 (GitHub)",
@@ -51,6 +52,7 @@ const STR = {
     missing: "missing", specsEmpty: "Spec docs generate as you talk", empty: "(empty)",
     tokens: "tokens", cache: "cache", computeSecs: "compute-s", roundsRefresh: "turns · refresh 3 min",
     theWorkbench: "Workbench that generates “{x}”", collapse: "Collapse", rounds: "rounds", ready: "ready",
+    provider: "Provider", model: "Model", unavailable: "unavailable",
     uploadSpec: "⬆ Build from spec", uploadTitle: "Upload a spec · one-click build",
     uSub: "Upload a markdown spec (or use the current SPEC); loop-engineer builds a job from it",
     uClient: "Client slug", uProject: "Project slug", uRepo: "Target repo (GitHub)",
@@ -69,6 +71,14 @@ interface ProjectDetail {
   conversation: ConversationEntry[];
 }
 
+interface ProviderDescriptor {
+  id: ProviderId;
+  label: string;
+  available: boolean;
+  models: string[];
+  error?: string;
+}
+
 export default function Workbench() {
   const [clients, setClients] = useState<Client[]>([]);
   const [projectsByClient, setProjectsByClient] = useState<Record<string, ProjectState[]>>({});
@@ -83,8 +93,12 @@ export default function Workbench() {
   const [usage, setUsage] = useState<Usage | null>(null);
   const [lang, setLang] = useState<Lang>("zh");
   const [sidebar, setSidebar] = useState(true);
+  const [providers, setProviders] = useState<ProviderDescriptor[]>([]);
+  const [defaultSelection, setDefaultSelection] = useState<ModelSelection>({ provider: "claude" });
   const [newClient, setNewClient] = useState<{ name: string; background: string } | null>(null);
-  const [newProject, setNewProject] = useState<{ client: string; name: string; dlvName: string; dlvType: DeliverableType } | null>(null);
+  const [newProject, setNewProject] = useState<{
+    client: string; name: string; dlvName: string; dlvType: DeliverableType; provider: ProviderId; model: string;
+  } | null>(null);
   // CC-61「上传现成 spec 一键构建」：上传 markdown → /api/plan → 轮询 job 状态
   const [uploadSpec, setUploadSpec] = useState<
     { client: string; project: string; repo: string; spec: string; fileName: string } | null
@@ -141,6 +155,12 @@ export default function Workbench() {
   useEffect(() => {
     loadClients();
     loadUsage();
+    fetch("/api/providers").then(async (r) => {
+      if (!r.ok) return;
+      const j = await r.json();
+      setProviders(j.providers ?? []);
+      setDefaultSelection(j.defaultSelection ?? { provider: "claude" });
+    }).catch(() => undefined);
     const t2 = setInterval(loadUsage, 180_000);
     if (typeof window !== "undefined") {
       const l = localStorage.getItem("fde:lang");
@@ -194,6 +214,8 @@ export default function Workbench() {
         name: newProject.name,
         deliverableName: newProject.dlvName || newProject.name,
         deliverableType: newProject.dlvType,
+        provider: newProject.provider,
+        model: newProject.model || undefined,
       }),
     });
     const j = await r.json();
@@ -244,6 +266,19 @@ export default function Workbench() {
     });
     const j = await r.json();
     flash(r.ok ? (j.detail ?? "已提交") : (j.error ?? "提交失败"), !r.ok);
+  };
+
+  const saveModelSelection = async (selection: ModelSelection) => {
+    if (!activeClient || !activeProject) return;
+    const r = await fetch(`/api/clients/${activeClient}/projects/${activeProject}`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(selection),
+    });
+    const j = await r.json();
+    if (!r.ok) return flash(j.error ?? "模型配置保存失败", true);
+    setDetail((current) => current ? { ...current, state: j.state } : current);
+    await loadProjects(activeClient);
   };
 
   // 打开「上传 spec 构建」：优先用当前选中项目预填 client/project/repo，spec 预填当前 SPEC.md
@@ -387,7 +422,14 @@ export default function Workbench() {
                       {(projectsByClient[c.slug]?.length ?? 0) === 0 && <div className="empty sm">{t.noProjects}</div>}
                       <button
                         className="ghost sm block"
-                        onClick={() => setNewProject({ client: c.slug, name: "", dlvName: "", dlvType: "video" })}
+                        onClick={() => setNewProject({
+                          client: c.slug,
+                          name: "",
+                          dlvName: "",
+                          dlvType: "video",
+                          provider: defaultSelection.provider,
+                          model: defaultSelection.model ?? "",
+                        })}
                       >
                         {t.newProject}
                       </button>
@@ -502,6 +544,36 @@ export default function Workbench() {
               <div className="dlv-type">{dlvLabel(detail.state.deliverable.type)}</div>
               <div className="dlv-name">{detail.state.deliverable.name}</div>
               <div className="dlv-sub">{t.theWorkbench.replace("{x}", detail.state.deliverable.name)}</div>
+              <div className="model-picker">
+                <label>{t.provider}</label>
+                <select
+                  value={(detail.state.model ?? defaultSelection).provider}
+                  onChange={(e) => {
+                    const provider = e.target.value as ProviderId;
+                    const firstModel = providers.find((p) => p.id === provider)?.models[0];
+                    saveModelSelection({ provider, ...(firstModel ? { model: firstModel } : {}) });
+                  }}
+                >
+                  {providers.map((p) => (
+                    <option key={p.id} value={p.id} disabled={!p.available}>
+                      {p.label}{p.available ? "" : ` (${t.unavailable})`}
+                    </option>
+                  ))}
+                </select>
+                {(detail.state.model ?? defaultSelection).provider === "lmstudio" && (
+                  <>
+                    <label>{t.model}</label>
+                    <select
+                      value={(detail.state.model ?? defaultSelection).model ?? ""}
+                      onChange={(e) => saveModelSelection({ provider: "lmstudio", model: e.target.value })}
+                    >
+                      {providers.find((p) => p.id === "lmstudio")?.models.map((model) => (
+                        <option key={model} value={model}>{model}</option>
+                      ))}
+                    </select>
+                  </>
+                )}
+              </div>
               {readiness && (
                 <div className="hint" style={{ marginTop: 10 }}>
                   {t.readinessLabel} <b style={{ color: "var(--text)" }}>{readiness.score}/100</b>
@@ -601,9 +673,35 @@ export default function Workbench() {
                 <option key={d.id} value={d.id}>{lang === "zh" ? d.label : d.labelEn}</option>
               ))}
             </select>
+            <label>{t.provider}</label>
+            <select value={newProject.provider} onChange={(e) => {
+              const provider = e.target.value as ProviderId;
+              const model = providers.find((p) => p.id === provider)?.models[0] ?? "";
+              setNewProject({ ...newProject, provider, model });
+            }}>
+              {providers.map((p) => (
+                <option key={p.id} value={p.id} disabled={!p.available}>
+                  {p.label}{p.available ? "" : ` (${t.unavailable})`}
+                </option>
+              ))}
+            </select>
+            {newProject.provider === "lmstudio" && (
+              <>
+                <label>{t.model}</label>
+                <select value={newProject.model}
+                  onChange={(e) => setNewProject({ ...newProject, model: e.target.value })}>
+                  {providers.find((p) => p.id === "lmstudio")?.models.map((model) => (
+                    <option key={model} value={model}>{model}</option>
+                  ))}
+                </select>
+              </>
+            )}
             <div className="modal-actions">
               <button className="ghost" onClick={() => setNewProject(null)}>{t.cancel}</button>
-              <button className="primary" onClick={createProject} disabled={!newProject.name.trim()}>{t.create}</button>
+              <button className="primary" onClick={createProject}
+                disabled={!newProject.name.trim() || (newProject.provider === "lmstudio" && !newProject.model)}>
+                {t.create}
+              </button>
             </div>
           </div>
         </div>

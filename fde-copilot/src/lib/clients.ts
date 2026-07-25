@@ -1,6 +1,6 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
-import type { Client, ConversationEntry, Deliverable, ProjectState } from "./types";
+import type { Client, ConversationEntry, Deliverable, ModelSelection, ProjectState } from "./types";
 import { SPEC_DOCS } from "./types";
 
 // clients/<client>/client.json + clients/<client>/projects/<project>/{docs,state,conversation}
@@ -128,7 +128,12 @@ export async function writeProjectState(s: ProjectState): Promise<void> {
   await fs.writeFile(path.join(dir, "state.json"), JSON.stringify(s, null, 2), "utf8");
 }
 
-export async function createProject(clientSlug: string, name: string, deliverable: Deliverable): Promise<ProjectState> {
+export async function createProject(
+  clientSlug: string,
+  name: string,
+  deliverable: Deliverable,
+  model?: ModelSelection,
+): Promise<ProjectState> {
   const client = await readClient(clientSlug);
   if (!client) throw new Error("客户不存在");
   const slug = slugify(name);
@@ -141,7 +146,7 @@ export async function createProject(clientSlug: string, name: string, deliverabl
   await fs.writeFile(path.join(dir, "conversation.jsonl"), "", "utf8");
   const state: ProjectState = {
     slug, clientSlug, name, deliverable,
-    createdAt: now, updatedAt: now, rounds: 0, status: "intake", lastReadiness: null,
+    createdAt: now, updatedAt: now, rounds: 0, status: "intake", lastReadiness: null, model,
   };
   await writeProjectState(state);
   return state;

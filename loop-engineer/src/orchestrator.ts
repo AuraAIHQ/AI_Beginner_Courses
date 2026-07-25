@@ -134,10 +134,11 @@ export async function runTask(
     await saveJob(job);
     return { ok: false, status: "failed", detail: task.lastResult, usage: taskUsage };
   }
-  if (coder.kind === "openai-chat") {
-    // agentic 编码需 Anthropic 端点或 codex；OpenAI 网关（HiLinkup）不能直接驱动 claude -p
+  if (!coder.capabilities.agenticCoder) {
+    // agentic 编码需 Anthropic 端点/codex，或声明 agenticCoder 的 OpenAI-compatible（LM Studio）。
+    // chat-only 网关（HiLinkup / openai-chat 云单发）不能直接驱动 claude -p。
     task.status = "failed";
-    task.lastResult = `coder 不能用 OpenAI 网关(${coder.name})：agentic 编码需 Anthropic 端点(claude/glm/kimi/deepseek 直连)或 codex`;
+    task.lastResult = `coder Provider(${coder.name})不具备 agenticCoder 能力`;
     log.err(`  ${task.lastResult}`);
     await saveJob(job);
     return { ok: false, status: "failed", detail: task.lastResult, usage: taskUsage };
@@ -233,7 +234,8 @@ export async function runTask(
       const callReviewer = async (
         rp: (typeof reviewers)[number],
       ): Promise<{ text: string; usage: Usage }> => {
-        if (rp.provider.kind === "openai-chat") {
+        // inline = 单发 chat（openai-chat 云单发 / openai-compatible 网关如 HiLinkup / 本地 LM Studio）
+        if (rp.provider.capabilities.contextAccess === "inline") {
           const r = await runChat(
             "你是严格、对抗性的代码评审员。直接输出一个 JSON 对象，第一个字符就是 {，不要任何解释文字或 markdown。",
             `${reviewPrompt}\n\n${reviewDiff}`,
