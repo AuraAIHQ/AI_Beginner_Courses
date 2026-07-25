@@ -307,6 +307,16 @@ export async function runTask(
     }
 
     if (success) {
+      // CC-63 P1 review(#71):被中止(job/task 超时后 runWithTimeout 放弃等待 → 本 fn 成孤儿)时,
+      // **绝不再做 push/merge/标 done 这些不可逆副作用** —— 编排层可能已把该 job 判 failed 并发过
+      // 终态 W5 回调。放弃等待 ≠ 取消运行,这里显式守卫 abort 才不会「已 failed 还偷偷 merge」。
+      if (hooks?.signal?.aborted) {
+        lastDetail = "任务已中止(超时),放弃回推/合并";
+        task.status = "blocked";
+        log.warn(`  ${lastDetail}`);
+        await appendJournal(job, task.id, `⚠ ${lastDetail}`);
+        return { ok: false, status: "blocked", detail: lastDetail, usage: taskUsage };
+      }
       const pr = await openPr(
         repo,
         branch,
