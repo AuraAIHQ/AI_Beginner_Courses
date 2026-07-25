@@ -34,4 +34,24 @@ const ok = JSON.parse(
 );
 assert.ok(!("error" in ok), "非失败事件不应带 error");
 
-console.log("🎉 clampReason / failed 回调 error ≤500 字 —— 全部断言通过");
+// 6. Fix B:phases 分节明细进回调 body(失败/成功都带),空/无则不带
+const withPhases = JSON.parse(
+  callbackBody({
+    event: "failed",
+    clientSlug: "c",
+    projectSlug: "p",
+    repo: "r",
+    error: "coding 阶段 1/2 失败",
+    costUsd: 0.3,
+    phases: [
+      { stage: "planning", costUsd: 0.02, inputTokens: 1000, outputTokens: 500, credits: 2 },
+      { stage: "T1", costUsd: 0.28, inputTokens: 90000, outputTokens: 20000, credits: 28 },
+    ],
+  }),
+);
+assert.ok(Array.isArray(withPhases.phases) && withPhases.phases.length === 2, "回调应带 phases 数组");
+assert.equal(withPhases.phases[1].stage, "T1");
+assert.equal(withPhases.phases[1].credits, 28, "每节点应带展示积分");
+assert.ok(!("phases" in ok), "无 phases 的事件不应带 phases 字段");
+
+console.log("🎉 clampReason ≤500 + phases 分节明细进回调 —— 全部断言通过");
