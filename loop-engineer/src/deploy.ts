@@ -136,9 +136,18 @@ export async function buildIfNeeded(dir: string): Promise<BuildOutcome> {
   // 走 coder 同款 sandboxEnv 白名单 —— 只放行 PATH/HOME/locale 等,剥离所有 *_API_KEY/*_TOKEN/
   // *_SECRET(WORKBENCH_CALLBACK_SECRET / CF token / push token / DEEPSEEK key 等),杜绝外泄。
   // 构建所需的非机密变量作为 extra 并入。
-  const env = sandboxEnv(process.env, { CI: "1", GIT_TERMINAL_PROMPT: "0", NEXT_TELEMETRY_DISABLED: "1", NODE_ENV: "production" });
+  // 不设 NODE_ENV=production:它会让 npm/pnpm/yarn 跳过 devDependencies,而构建工具
+  // (tailwindcss/postcss、typescript、vite、next 插件…)恰恰在 devDeps → build 会
+  // 「Cannot find module」挂掉(flight-monitor 实测)。next/vite build 本就产生产物,不需要它。
+  const env = sandboxEnv(process.env, { CI: "1", GIT_TERMINAL_PROMPT: "0", NEXT_TELEMETRY_DISABLED: "1" });
   const opts = { cwd: dir, env, maxBuffer: 16 * 1024 * 1024, timeout: 300_000 } as const;
-  const installArgs = pm === "npm" ? ["install", "--no-audit", "--no-fund"] : pm === "pnpm" ? ["install", "--no-frozen-lockfile"] : ["install"];
+  // --include=dev / --prod=false:双保险确保 devDeps(构建工具)装上,即便环境残留 NODE_ENV=production。
+  const installArgs =
+    pm === "npm"
+      ? ["install", "--no-audit", "--no-fund", "--include=dev"]
+      : pm === "pnpm"
+        ? ["install", "--no-frozen-lockfile", "--prod=false"]
+        : ["install", "--production=false"];
   log.step(`部署前构建(${pm}):${dir}`);
   await pexec(pm, installArgs, opts);
   await pexec(pm, ["run", "build"], opts);
