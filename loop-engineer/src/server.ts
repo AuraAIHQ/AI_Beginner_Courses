@@ -39,7 +39,7 @@ import { checkWorkbenchToken, checkOrigin } from "./auth.js";
 import { emitLifecycle } from "./lifecycle.js";
 import { createPool } from "./pool.js";
 import { installCallbackSink } from "./callback.js";
-import { cfCreds, deployStaticDir, cleanupExpiredPages } from "./deploy.js";
+import { cfCreds, deployStaticDir, buildIfNeeded, cleanupExpiredPages } from "./deploy.js";
 import { log } from "./log.js";
 import { ZERO, add } from "./usage.js";
 import type { Usage } from "./usage.js";
@@ -691,10 +691,12 @@ async function handleDeploy(req: IncomingMessage, res: ServerResponse): Promise<
   const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "wb-deploy-"));
   try {
     await ensureClone(repo, path.join(tmp, "repo"), "main", loopPushToken());
-    const result = await deployStaticDir(path.join(tmp, "repo"), clientSlug, projectSlug, cf);
+    // 部署前构建:框架项目(有 build 脚本)→ install+build → 部署产物目录;纯静态 → 原目录。
+    const build = await buildIfNeeded(path.join(tmp, "repo"));
+    const result = await deployStaticDir(build.deployDir, clientSlug, projectSlug, cf);
     // 发 deployed 回调(带 appUrl),hack5 翻徽章 + 展示在线链接
     await emitLifecycle({ event: "deployed", clientSlug, projectSlug, repo, appUrl: result.appUrl });
-    send(res, 200, result);
+    send(res, 200, { ...result, built: build.built, ...(build.note ? { buildNote: build.note } : {}) });
   } catch (e) {
     log.err(`部署失败(${clientSlug}/${projectSlug})：${(e as Error).message}`);
     send(res, 500, { error: `部署失败：${(e as Error).message}` });
