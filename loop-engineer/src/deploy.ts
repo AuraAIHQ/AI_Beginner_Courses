@@ -9,7 +9,10 @@
  */
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { promises as fs } from "node:fs";
+import path from "node:path";
 import { log } from "./log.js";
+import { sandboxEnv } from "./providers.js";
 
 const pexec = promisify(execFile);
 const API = "https://api.cloudflare.com/client/v4";
@@ -80,6 +83,79 @@ const SELF_DEPLOY_HINT =
   "想长期托管到你自己的账号：① 注册 Cloudflare（免费）→ Workers & Pages → Create → Pages；" +
   "② 连上这个 GitHub 仓（main 分支）自动构建部署，或本机装 wrangler 后在仓目录跑 " +
   "`npx wrangler pages deploy . --project-name=<你起的名>`。我方这份托管 7 天后自动删除。";
+
+// 常见静态产物目录(按站点优先级);build 后在此列表里找可部署目录。
+// .vercel/output/static = @cloudflare/next-on-pages / Vercel 静态导出;out = Next `output:export`;dist = Vite/Astro;build = CRA。
+const OUTPUT_DIRS = ["out", "dist", "build", ".vercel/output/static", "public"];
+
+async function pathExists(p: string): Promise<boolean> {
+  return fs.access(p).then(() => true).catch(() => false);
+}
+
+/** 在 dir 下按优先级找可部署的静态产物目录;都不存在返回 null。导出供测试。 */
+export async function findDeployableOutput(dir: string): Promise<string | null> {
+  for (const d of OUTPUT_DIRS) {
+    if (await pathExists(path.join(dir, d))) return path.join(dir, d);
+  }
+  return null;
+}
+
+/** 探测包管理器(按 lockfile);默认 npm。 */
+async function detectPackageManager(dir: string): Promise<"pnpm" | "yarn" | "npm"> {
+  if (await pathExists(path.join(dir, "pnpm-lock.yaml"))) return "pnpm";
+  if (await pathExists(path.join(dir, "yarn.lock"))) return "yarn";
+  return "npm";
+}
+
+export interface BuildOutcome {
+  /** 最终要部署的目录(build 产物,或纯静态时的原目录)。 */
+  deployDir: string;
+  built: boolean;
+  /** 给用户的提示(如 Next.js SSR 未产出静态目录)。 */
+  note?: string;
+}
+
+/**
+ * 部署前构建:若是前端框架项目(package.json 有 build 脚本)→ 装依赖 + build → 返回构建产物目录;
+ * 纯静态(无 package.json / 无 build 脚本)→ 原目录直接部署(现状行为)。
+ *
+ * ⚠️ 会在容器内跑克隆仓库的 install/build 脚本(执行不可信代码)—— 与 coder(claude -p 同容器跑作品代码)
+ * 同一信任模型;后续可隔离到独立 sandbox。带超时(各 5min),失败抛错由调用方兜成 500。
+ */
+export async function buildIfNeeded(dir: string): Promise<BuildOutcome> {
+  let pkg: { scripts?: Record<string, string>; dependencies?: Record<string, string>; devDependencies?: Record<string, string> } | null = null;
+  try {
+    pkg = JSON.parse(await fs.readFile(path.join(dir, "package.json"), "utf8"));
+  } catch {
+    return { deployDir: dir, built: false }; // 无 package.json → 纯静态,原样部署
+  }
+  if (!pkg?.scripts?.build) return { deployDir: dir, built: false }; // 无 build 脚本 → 当作静态
+
+  const pm = await detectPackageManager(dir);
+  // 安全(pr-daemon #68 review):build 脚本是不可信仓库代码,绝不能拿到 host secret。
+  // 走 coder 同款 sandboxEnv 白名单 —— 只放行 PATH/HOME/locale 等,剥离所有 *_API_KEY/*_TOKEN/
+  // *_SECRET(WORKBENCH_CALLBACK_SECRET / CF token / push token / DEEPSEEK key 等),杜绝外泄。
+  // 构建所需的非机密变量作为 extra 并入。
+  const env = sandboxEnv(process.env, { CI: "1", GIT_TERMINAL_PROMPT: "0", NEXT_TELEMETRY_DISABLED: "1", NODE_ENV: "production" });
+  const opts = { cwd: dir, env, maxBuffer: 16 * 1024 * 1024, timeout: 300_000 } as const;
+  const installArgs = pm === "npm" ? ["install", "--no-audit", "--no-fund"] : pm === "pnpm" ? ["install", "--no-frozen-lockfile"] : ["install"];
+  log.step(`部署前构建(${pm}):${dir}`);
+  await pexec(pm, installArgs, opts);
+  await pexec(pm, ["run", "build"], opts);
+
+  const found = await findDeployableOutput(dir);
+  if (found) {
+    log.ok(`构建产物目录:${path.relative(dir, found)}`);
+    return { deployDir: found, built: true };
+  }
+  // 有 build 脚本但没找到静态产物 —— 大概率 Next.js 默认 SSR(只产 .next,非静态)。
+  const isNext = !!(pkg.dependencies?.next || pkg.devDependencies?.next);
+  const note = isNext
+    ? "检测到 Next.js 但未产出静态目录(out/)。SSR 应用需 next.config 设 output:'export' 静态导出,或用 @cloudflare/next-on-pages 适配;本次回退部署源码目录,可能不可用。"
+    : "build 完成但未找到 out/dist/build 等静态产物目录,回退部署源码目录。";
+  log.warn(note);
+  return { deployDir: dir, built: true, note };
+}
 
 /**
  * 把一个静态目录部署到 CF Pages，返回生产 URL（<name>.pages.dev，稳定别名）。
