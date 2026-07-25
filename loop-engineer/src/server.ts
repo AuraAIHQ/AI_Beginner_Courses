@@ -36,7 +36,7 @@ import { isGitRepo, pruneWorktrees, isRemoteRepo, ensureClone, pushRefs } from "
 import { runWithTimeout } from "./timeout.js";
 import { writeStatus, readStatus } from "./persist.js";
 import { checkWorkbenchToken, checkOrigin } from "./auth.js";
-import { emitLifecycle } from "./lifecycle.js";
+import { emitLifecycle, type PhaseUsage } from "./lifecycle.js";
 import { createPool } from "./pool.js";
 import { installCallbackSink } from "./callback.js";
 import { cfCreds, deployStaticDir, buildIfNeeded, cleanupExpiredPages } from "./deploy.js";
@@ -63,6 +63,19 @@ interface JobRecord {
   needsPlan?: boolean;
   /** CC-54：本 job 累计用量(planning + 各任务 coder/reviewer)。coding_done/failed 回调回传 costUsd。 */
   usage: Usage;
+  /** Fix B：分节用量(每关键节点花多少/积分/卡点)。随 coding_done/failed 回调 durable 送前端。 */
+  phases: PhaseUsage[];
+}
+
+/** 记一个节点的用量到 job(planning / 各任务)。credits 展示用;计费仍以事件级 costUsd 总额为准。 */
+function pushPhase(rec: JobRecord, stage: string, u: Usage): void {
+  rec.phases.push({
+    stage,
+    costUsd: u.costUsd,
+    inputTokens: u.inputTokens,
+    outputTokens: u.outputTokens,
+    credits: Math.ceil(u.costUsd * 100),
+  });
 }
 
 /** 从规格目录反推 clientSlug/projectSlug（.../clients/<c>/projects/<p>） */
@@ -95,6 +108,8 @@ async function persist(rec: JobRecord): Promise<void> {
       appUrl: rec.appUrl,
       error: rec.error,
       updatedAt: rec.updatedAt,
+      usage: { inputTokens: rec.usage.inputTokens, outputTokens: rec.usage.outputTokens, costUsd: rec.usage.costUsd },
+      phases: rec.phases,
     });
   } catch (e) {
     log.warn(`状态落盘失败(${rec.jobId})：${(e as Error).message}`);
@@ -165,6 +180,7 @@ function enqueue(jobId: string): void {
           setState(r0, "planning");
           const planUsage = await planSpec(r0.specDir, config, { repo: r0.repo });
           r0.usage = add(r0.usage, planUsage); // CC-54：planning 成本计入 job
+          pushPhase(r0, "planning", planUsage); // Fix B：planning 节点成本
           r0.needsPlan = false;
         }
         if (signal?.aborted) return;
@@ -197,6 +213,7 @@ function enqueue(jobId: string): void {
           costUsd: fin.usage.costUsd,
           inputTokens: fin.usage.inputTokens,
           outputTokens: fin.usage.outputTokens,
+          phases: fin.phases, // Fix B：失败也带分节明细(每步花多少 + 卡在哪)
         });
       }
     },
@@ -272,6 +289,7 @@ async function processJob(jobId: string, signal?: AbortSignal): Promise<void> {
         signal,
       });
       rec.usage = add(rec.usage, result.usage); // CC-54：每任务成本累加进 job
+      pushPhase(rec, task.id, result.usage); // Fix B：本任务节点成本(coder + 评审 + 返工)
       if (result.prUrl) rec.prUrl = result.prUrl;
     } catch (e) {
       task.status = "failed";
@@ -322,6 +340,7 @@ async function processJob(jobId: string, signal?: AbortSignal): Promise<void> {
       costUsd: rec.usage.costUsd,
       inputTokens: rec.usage.inputTokens,
       outputTokens: rec.usage.outputTokens,
+      phases: rec.phases, // Fix B：成功也带分节明细(每步花多少)
     });
   }
 }
@@ -448,6 +467,7 @@ async function findJobRecord(jobId: string): Promise<JobRecord | undefined> {
     state: deriveState(job),
     updatedAt: new Date().toISOString(),
     usage: { ...ZERO },
+    phases: [],
   };
   if (snap) {
     const snapState = snap.state as JobState;
@@ -462,6 +482,9 @@ async function findJobRecord(jobId: string): Promise<JobRecord | undefined> {
     rec.appUrl = snap.appUrl;
     if (rec.state === "failed" && !rec.error) rec.error = snap.error;
     rec.updatedAt = snap.updatedAt;
+    // Fix B：回读成本/分节明细,让重启后 /status 仍显示每步花费(不重置为 0)。
+    if (snap.usage) rec.usage = { ...ZERO, ...snap.usage };
+    if (snap.phases) rec.phases = snap.phases;
   }
   registry.set(jobId, rec);
   return rec;
@@ -536,6 +559,7 @@ async function handlePlan(req: IncomingMessage, res: ServerResponse): Promise<vo
     needsPlan: true,
     updatedAt: new Date().toISOString(),
     usage: { ...ZERO },
+    phases: [],
   };
   registry.set(jobId, rec);
   void persist(rec);
@@ -618,6 +642,8 @@ async function handleStatus(res: ServerResponse, jobId: string): Promise<void> {
     costUsd: rec.usage.costUsd,
     inputTokens: rec.usage.inputTokens,
     outputTokens: rec.usage.outputTokens,
+    // Fix B：分节明细(每步花多少/积分/卡点),前端可实时展示;失败/成功回调也带同结构。
+    ...(rec.phases.length ? { phases: rec.phases } : {}),
     ...(rec.prUrl ? { prUrl: rec.prUrl } : {}),
     ...(rec.appUrl ? { appUrl: rec.appUrl } : {}),
     ...(rec.error ? { error: rec.error } : {}),
