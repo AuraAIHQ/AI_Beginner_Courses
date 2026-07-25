@@ -12,6 +12,21 @@ import { log } from "./log.js";
  */
 export type LifecycleEventName = "loop_ready" | "coding_done" | "deployed" | "failed";
 
+/**
+ * 分节用量（每关键节点:planning / 各任务）。让前端(hack5 / fde-copilot)能展示
+ * 「每一步花多少、卡在哪、该扣多少积分」,且随 coding_done/failed 回调 durable 送达
+ * —— 不受 CF Container 回收丢日志影响。
+ */
+export interface PhaseUsage {
+  /** 节点标识:"planning" | 任务 id(如 "T1")。 */
+  stage: string;
+  costUsd: number;
+  inputTokens: number;
+  outputTokens: number;
+  /** 展示用积分 = ceil(costUsd×100)。计费口径以事件级 costUsd 总额为准(逐节点 ceil 求和会略高于总额)。 */
+  credits: number;
+}
+
 export interface LifecycleEvent {
   event: LifecycleEventName;
   clientSlug: string;
@@ -26,6 +41,8 @@ export interface LifecycleEvent {
   /** CC-54：token 明细(便于 hack5 对账;可选)。 */
   inputTokens?: number;
   outputTokens?: number;
+  /** 分节用量明细(planning + 各任务),供前端展示每步成本/积分/卡点。失败也带(已花即已计)。 */
+  phases?: PhaseUsage[];
 }
 
 export type LifecycleSink = (evt: LifecycleEvent) => void | Promise<void>;
