@@ -36,7 +36,23 @@ assert.ok(empty.note.includes("无输入"));
 const both = estimateJob({ idea: "x", spec: "- a\n- b\n- c\n- d\n- e\n- f\n- g" });
 assert.equal(both.signals.featureCount, 7);
 
-console.log("🎉 estimate 档位/区间/信号 —— 全部断言通过");
+// 7. CC-61 校准:极短「外部API+定时+邮件」idea 不再欠估(旧版 S 5-15,实际 cheap-flight 48 积分)
+const terseFullstack = estimateJob({ idea: "实时股价监控提醒:需外部股票行情API + 后端定时任务拉取 + 价格突破阈值邮件发送" });
+assert.ok(["M", "L"].includes(terseFullstack.tier), `极短全栈 idea 应 M/L,实际 ${terseFullstack.tier}`);
+assert.ok(terseFullstack.creditsHigh >= 50, `creditsHigh 应 ≥50(覆盖实际 48),实际 ${terseFullstack.creditsHigh}`);
+assert.equal(terseFullstack.confidence, "low", "极短多信号 idea 应 low 置信");
+assert.ok(terseFullstack.signals.matched.includes("externalApi"), "应识别 externalApi 信号");
+
+// 8. 简单 idea 仍是低档(校准不该把简单的抬高)
+const simple = estimateJob({ idea: "一个待办清单网页" });
+assert.ok(["XS", "S"].includes(simple.tier), `简单 idea 应 XS/S,实际 ${simple.tier}`);
+assert.equal(simple.signals.matched.length, 0, "简单 idea 不该有能力信号");
+
+// 9. ≥3 个集成信号抬档到 ≥M(经验:必是多任务全栈)
+const threeSig = estimateJob({ idea: "登录后调天气API定时抓取并邮件通知" });
+assert.ok(["M", "L"].includes(threeSig.tier), `3+ 集成信号应 ≥M,实际 ${threeSig.tier}`);
+
+console.log("🎉 estimate 档位/区间/信号 + CC-61 校准 —— 全部断言通过");
 for (const [name, r] of Object.entries({ xs, mSpec, backend })) {
   console.log(`   ${name}: tier=${r.tier} credits=${r.creditsLow}-${r.creditsHigh}`);
 }
