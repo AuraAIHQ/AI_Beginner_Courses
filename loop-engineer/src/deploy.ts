@@ -84,11 +84,13 @@ const SELF_DEPLOY_HINT =
   "② 连上这个 GitHub 仓（main 分支）自动构建部署，或本机装 wrangler 后在仓目录跑 " +
   "`npx wrangler pages deploy . --project-name=<你起的名>`。我方这份托管 7 天后自动删除。";
 
-// 常见静态产物目录(按站点优先级);build 后在此列表里找可部署目录。
+// 常见静态产物目录(按站点优先级);非-Next 框架 build 后在此列表里找可部署目录。
 // .vercel/output/static = @cloudflare/next-on-pages 适配产物;out = Next `output:export`;dist = Vite/Astro;build = CRA。
-// 注意:不含 `public` —— 那是 Next.js/CRA 的静态资产源目录(favicon 等),不是构建产物,
-// 误当产物部署会得到无 index.html 的 404 页(flight-monitor 实测)。
-const OUTPUT_DIRS = ["out", "dist", "build", ".vercel/output/static"];
+// `public` = Gatsby / Hugo / Eleventy 的**构建产物**目录(它们就把成品写进 public/)—— 必须保留。
+// 唯一坑是 Next.js:它的 public/ 是静态资产源(favicon 等)不是产物,误部署会得 404。但 Next 已被
+// 上面的 isNext 分支在到达本列表前单独处理(next-on-pages / out),永不落到这里 —— 故对 Next 无回归,
+// 对 Gatsby/Hugo 反而不能少 public(pr-daemon #74 review)。
+const OUTPUT_DIRS = ["out", "dist", "build", ".vercel/output/static", "public"];
 
 async function pathExists(p: string): Promise<boolean> {
   return fs.access(p).then(() => true).catch(() => false);
@@ -107,6 +109,24 @@ async function detectPackageManager(dir: string): Promise<"pnpm" | "yarn" | "npm
   if (await pathExists(path.join(dir, "pnpm-lock.yaml"))) return "pnpm";
   if (await pathExists(path.join(dir, "yarn.lock"))) return "yarn";
   return "npm";
+}
+
+/**
+ * 探测 Next.js 是否配了 `output: 'export'`(纯静态导出 → `next build` 直接产 out/,无需 next-on-pages)。
+ * 轻量正则扫 next.config.*(不执行),匹配不到就按默认 SSR 处理(交给 next-on-pages)。
+ * 目的(pr-daemon #74 建议):export 模式省掉 ~8min next-on-pages 适配,而**不**给常见 SSR 应用
+ * 引入「next build + next-on-pages 内部再 build」的双重构建。
+ */
+async function nextIsStaticExport(dir: string): Promise<boolean> {
+  for (const f of ["next.config.js", "next.config.mjs", "next.config.ts", "next.config.cjs"]) {
+    try {
+      const src = await fs.readFile(path.join(dir, f), "utf8");
+      if (/output\s*:\s*['"`]export['"`]/.test(src)) return true;
+    } catch {
+      /* 文件不存在 → 试下一个 */
+    }
+  }
+  return false;
 }
 
 export interface BuildOutcome {
@@ -153,14 +173,27 @@ export async function buildIfNeeded(dir: string): Promise<BuildOutcome> {
   log.step(`部署前构建(${pm}):${dir}`);
   await pexec(pm, installArgs, opts);
 
-  // Next.js:默认 `next build` 只产 .next(SSR,非静态,CF Pages 部署不了)。用官方
-  // @cloudflare/next-on-pages 适配成 CF Pages 兼容产物(.vercel/output/static + Functions)。
-  // 它内部自己跑 next build,故此分支不另跑 `run build`。适配失败(常见:动态/API 路由未声明
-  // edge runtime)→ 回退给可读 note,不强行部署坏产物。
+  // Next.js 分两条路:① output:'export' 静态导出 → `next build` 直接产 out/,直接部署;
+  // ② 默认 SSR/hybrid → `next build` 只产 .next(CF Pages 部署不了)→ 官方 @cloudflare/next-on-pages
+  // 适配成兼容产物(.vercel/output/static + Functions,它内部自跑 next build,故 SSR 路不另跑 run build)。
+  // 适配失败(常见:动态/API 路由未声明 edge runtime)→ 回退给可读 note,不强行部署坏产物。
   const isNext = !!(pkg.dependencies?.next || pkg.devDependencies?.next);
   if (isNext) {
+    // 先看是否 output:'export'(静态导出)—— 是则普通 `next build` 就产 out/,直接部署,
+    // 省掉后面 ~8min 的 next-on-pages 适配。只认 out/(export 产物),不碰 public/(资产源)。
+    if (await nextIsStaticExport(dir)) {
+      log.step("Next.js output:export → next build → out/");
+      await pexec(pm, ["run", "build"], opts);
+      const outDir = path.join(dir, "out");
+      if (await pathExists(outDir)) {
+        log.ok("Next.js 静态导出产物:out/");
+        return { deployDir: outDir, built: true };
+      }
+      log.warn("声明 output:export 但未产出 out/,回退 next-on-pages 适配");
+    }
+    // 默认 SSR/hybrid(只产 .next,CF Pages 部署不了)→ next-on-pages 适配成兼容产物。
     try {
-      log.step("Next.js → @cloudflare/next-on-pages 适配 CF Pages");
+      log.step("Next.js SSR → @cloudflare/next-on-pages 适配 CF Pages");
       await pexec("npx", ["--yes", "@cloudflare/next-on-pages@1"], { ...opts, timeout: 480_000 });
     } catch (e) {
       const msg = (e as Error).message.slice(0, 300);
