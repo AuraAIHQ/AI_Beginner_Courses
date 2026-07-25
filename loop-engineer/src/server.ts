@@ -243,6 +243,18 @@ function jobTimeoutMs(): number {
   return Number.isFinite(n) && n > 0 ? n : DEFAULT;
 }
 
+/** 每-task 超时（默认 15min）。单个 plan/code/review 任务卡死 → 快速判该 task 失败,不拖满 job 超时。 */
+function taskTimeoutMs(): number {
+  const DEFAULT = 15 * 60 * 1000;
+  const n = Number(process.env.LOOP_TASK_TIMEOUT_MS ?? DEFAULT);
+  return Number.isFinite(n) && n > 0 ? n : DEFAULT;
+}
+
+/** 合并 job 级 + task 级中止信号:任一 abort 即中止本 task。 */
+function combineSignals(a: AbortSignal | undefined, b: AbortSignal): AbortSignal {
+  return a ? AbortSignal.any([a, b]) : b;
+}
+
 /** 超时/失败后清理该 repo 遗留的半成品 worktree（尽力而为）。 */
 async function pruneRepoWorktrees(repo?: string): Promise<void> {
   if (!repo) return;
@@ -283,20 +295,33 @@ async function processJob(jobId: string, signal?: AbortSignal): Promise<void> {
     if (!task) break; // 有 pending 但被依赖阻塞
     task.status = "in_progress";
     await saveJob(job);
-    try {
-      const result = await runTask(job, task, config, {
-        onPhase: (phase) => setState(rec, phase),
-        signal,
-      });
+    // CC-63 P1：每-task 硬超时。task 卡死(子进程挂、评审模型不响应)→ runWithTimeout 强制返回,
+    // 不再干等 → 判该 task failed → job 收工判 failed → 一定发 W5 failed 回调(不再悬空)。
+    const r = await runWithTimeout(
+      (taskSignal) =>
+        runTask(job, task, config, {
+          onPhase: (phase) => setState(rec, phase),
+          signal: combineSignals(signal, taskSignal),
+        }),
+      taskTimeoutMs(),
+    );
+    if (r.timedOut) {
+      task.status = "failed";
+      task.lastResult = `task ${task.id} 超时（${Math.round(taskTimeoutMs() / 60000)}min），已中止`;
+      await saveJob(job);
+      log.err(`任务 ${task.id} 超时`);
+      if (signal?.aborted) break; // job 级超时触发的 → 不再取下一个任务
+    } else if (r.error) {
+      task.status = "failed";
+      task.lastResult = (r.error as Error).message;
+      await saveJob(job);
+      log.err(`任务 ${task.id} 异常：${(r.error as Error).message}`);
+      if (signal?.aborted) break;
+    } else {
+      const result = r.value!;
       rec.usage = add(rec.usage, result.usage); // CC-54：每任务成本累加进 job
       pushPhase(rec, task.id, result.usage); // Fix B：本任务节点成本(coder + 评审 + 返工)
       if (result.prUrl) rec.prUrl = result.prUrl;
-    } catch (e) {
-      task.status = "failed";
-      task.lastResult = (e as Error).message;
-      await saveJob(job);
-      log.err(`任务 ${task.id} 异常：${(e as Error).message}`);
-      if (signal?.aborted) break; // job 超时 → 不再取下一个任务
     }
   }
 
