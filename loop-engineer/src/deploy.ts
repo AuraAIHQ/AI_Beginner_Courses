@@ -12,6 +12,7 @@ import { promisify } from "node:util";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { log } from "./log.js";
+import { sandboxEnv } from "./providers.js";
 
 const pexec = promisify(execFile);
 const API = "https://api.cloudflare.com/client/v4";
@@ -131,7 +132,11 @@ export async function buildIfNeeded(dir: string): Promise<BuildOutcome> {
   if (!pkg?.scripts?.build) return { deployDir: dir, built: false }; // 无 build 脚本 → 当作静态
 
   const pm = await detectPackageManager(dir);
-  const env = { ...process.env, CI: "1", GIT_TERMINAL_PROMPT: "0", NEXT_TELEMETRY_DISABLED: "1" };
+  // 安全(pr-daemon #68 review):build 脚本是不可信仓库代码,绝不能拿到 host secret。
+  // 走 coder 同款 sandboxEnv 白名单 —— 只放行 PATH/HOME/locale 等,剥离所有 *_API_KEY/*_TOKEN/
+  // *_SECRET(WORKBENCH_CALLBACK_SECRET / CF token / push token / DEEPSEEK key 等),杜绝外泄。
+  // 构建所需的非机密变量作为 extra 并入。
+  const env = sandboxEnv(process.env, { CI: "1", GIT_TERMINAL_PROMPT: "0", NEXT_TELEMETRY_DISABLED: "1", NODE_ENV: "production" });
   const opts = { cwd: dir, env, maxBuffer: 16 * 1024 * 1024, timeout: 300_000 } as const;
   const installArgs = pm === "npm" ? ["install", "--no-audit", "--no-fund"] : pm === "pnpm" ? ["install", "--no-frozen-lockfile"] : ["install"];
   log.step(`部署前构建(${pm}):${dir}`);

@@ -5,6 +5,7 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { buildIfNeeded, findDeployableOutput } from "../src/deploy.js";
+import { sandboxEnv } from "../src/providers.js";
 
 async function mk(files: Record<string, string>): Promise<string> {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "deploybuild-"));
@@ -46,10 +47,21 @@ async function main() {
     "应命中 next-on-pages 的 .vercel/output/static",
   );
 
+  // 4. 安全(pr-daemon #68):build 用的 sandboxEnv 必须剥离 secret、保留构建变量。
+  const buildEnv = sandboxEnv(
+    { PATH: "/usr/bin", HOME: "/root", WORKBENCH_CALLBACK_SECRET: "s", CLOUDFLARE_API_TOKEN: "t", PAGES_CF_TOKEN_THAI_TEA: "p", DEEPSEEK_API_KEY: "k", GITHUB_BOT_TOKEN: "g", WORKBENCH_TOKEN: "w" },
+    { CI: "1", NEXT_TELEMETRY_DISABLED: "1" },
+  );
+  for (const secret of ["WORKBENCH_CALLBACK_SECRET", "CLOUDFLARE_API_TOKEN", "PAGES_CF_TOKEN_THAI_TEA", "DEEPSEEK_API_KEY", "GITHUB_BOT_TOKEN", "WORKBENCH_TOKEN"]) {
+    assert.ok(!(secret in buildEnv), `build env 绝不能含 secret ${secret}`);
+  }
+  assert.equal(buildEnv.PATH, "/usr/bin", "build env 应保留 PATH");
+  assert.equal(buildEnv.CI, "1", "build env 应保留构建变量 CI");
+
   for (const d of [staticDir, noBuild, noOut, withDist, withOutAndDist, withVercel]) {
     await fs.rm(d, { recursive: true, force: true });
   }
-  console.log("🎉 deploy 构建前处理 —— 全部断言通过(纯静态原样、无 build 原样、产物目录探测优先级)");
+  console.log("🎉 deploy 构建前处理 —— 全部断言通过(纯静态原样、产物目录探测、build env 剥离 secret)");
 }
 
 main().catch((e) => {
