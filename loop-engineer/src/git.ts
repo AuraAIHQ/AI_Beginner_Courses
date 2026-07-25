@@ -261,10 +261,41 @@ export async function removeWorktree(repo: string, wtPath: string): Promise<void
   await tryGit(repo, ["worktree", "prune"]);
 }
 
-/** 任务分支相对集成分支的 diff（喂给单发 chat reviewer；容量上限保护） */
+// 生成物/依赖目录：绝不该进 commit 或评审 diff。coder 若没写 .gitignore,`git add -A`
+// 会把整个 node_modules(几千文件)提交 → 评审 diff 被淹没 + 60k 截断 → 评审「关键实现 diff
+// 缺失」误判打回 → 任务假失败(真实故障根因,见 CC-60 stockalert)。
+const VENDOR_DIRS = ["node_modules", ".next", "dist", "build", ".turbo", "coverage", ".venv", "__pycache__", "target"] as const;
+const BASELINE_IGNORES = [...VENDOR_DIRS.map((d) => `${d}/`), ".env", ".env.local", ".env.*.local", "*.log", ".DS_Store"];
+// review diff 的 pathspec：`:/` = 仓库根(含全部)；`:(exclude,top)dir` = 锚定仓库根排除 vendored。
+// 用 top 锚定而非 `.`：`.` 依赖 git 进程 cwd(生产里 server cwd ≠ worktree)会失配 → 排除失效。
+const DIFF_INCLUDE_ROOT = ":/";
+const DIFF_EXCLUDES = VENDOR_DIRS.map((d) => `:(exclude,top)${d}`);
+
+/**
+ * 确保 worktree 有基线 .gitignore（幂等：只补缺失行）。在首次 commit 前调,防 coder 忘写
+ * .gitignore 时 `git add -A` 把 node_modules 卷进提交/评审 diff。
+ */
+async function ensureGitignore(wtPath: string): Promise<void> {
+  const gi = path.join(wtPath, ".gitignore");
+  let existing = "";
+  try {
+    existing = await fs.readFile(gi, "utf8");
+  } catch {
+    /* 无 .gitignore → 新建 */
+  }
+  const have = new Set(existing.split(/\r?\n/).map((l) => l.trim()));
+  const missing = BASELINE_IGNORES.filter((v) => !have.has(v));
+  if (missing.length === 0) return;
+  const banner = existing && !existing.endsWith("\n") ? "\n" : "";
+  await fs.writeFile(gi, `${existing}${banner}# loop-engineer baseline ignores\n${missing.join("\n")}\n`, "utf8");
+}
+
+/** 任务分支相对集成分支的 diff（喂给单发 chat reviewer；排除 vendored + 容量上限保护） */
 export async function diffAgainst(wtPath: string, integrationBranch: string): Promise<string> {
-  const diff = (await tryGit(wtPath, ["diff", `${integrationBranch}...HEAD`])) ?? "";
-  const stat = (await tryGit(wtPath, ["diff", "--stat", `${integrationBranch}...HEAD`])) ?? "";
+  const range = `${integrationBranch}...HEAD`;
+  // 双保险：即便 vendored 目录不慎被提交,评审 diff 也只看真实源码(否则真实现被 node_modules 挤掉+截断)。
+  const diff = (await tryGit(wtPath, ["diff", range, "--", DIFF_INCLUDE_ROOT, ...DIFF_EXCLUDES])) ?? "";
+  const stat = (await tryGit(wtPath, ["diff", "--stat", range, "--", DIFF_INCLUDE_ROOT, ...DIFF_EXCLUDES])) ?? "";
   const capped = diff.length > 60_000 ? diff.slice(0, 60_000) + "\n…(diff 过长已截断)" : diff;
   return `## 改动概览\n${stat}\n\n## 完整 diff\n${capped}`;
 }
@@ -275,7 +306,11 @@ export async function hasChanges(wtPath: string): Promise<boolean> {
 }
 
 export async function commitAll(wtPath: string, message: string): Promise<boolean> {
+  await ensureGitignore(wtPath); // 先落基线 .gitignore,让 add -A 天然跳过 node_modules 等
   await git(wtPath, ["add", "-A"]);
+  // 若 vendored 目录在之前的 attempt 已被 tracked(.gitignore 对已跟踪文件无效)→ 从暂存区剔除,
+  // 不进本次 commit,也就不进评审 diff。--ignore-unmatch:没有也不报错。
+  await tryGit(wtPath, ["rm", "-r", "--cached", "--ignore-unmatch", "--", ...VENDOR_DIRS]);
   if (!(await hasChanges(wtPath))) return false;
   await git(wtPath, ["commit", "-m", message]);
   return true;
