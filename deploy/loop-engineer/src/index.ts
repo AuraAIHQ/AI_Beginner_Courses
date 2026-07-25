@@ -24,6 +24,10 @@ const PASSTHROUGH_KEYS = [
   "LOOP_REPO_ROOT",
   "CLOUDFLARE_API_TOKEN",
   "CLOUDFLARE_ACCOUNT_ID",
+  // /deploy 专用的 CF Pages 凭据（thai-tea 账号,与 Workers-AI 的 CLOUDFLARE_* 隔离)。
+  // cfCreds() 优先读这俩;漏配就落 CLOUDFLARE_* 兜底。此前未 passthrough → 设了 secret 也进不了容器 → /deploy 501。
+  "PAGES_CF_TOKEN_THAI_TEA",
+  "THAI_TEA_CLIENT_ID",
   // —— 并发/超时可调项（可选）——
   "LOOP_CONCURRENCY",
   "LOOP_JOB_TIMEOUT_MS",
