@@ -37,6 +37,8 @@ const STR = {
     build: "🚀 构建", building: "提交中…", jobTitle: "构建任务", jobState: "状态",
     jobProgress: "进度", jobCurrent: "当前", viewPr: "查看 PR ↗", viewApp: "在线预览 ↗",
     jobDone: "✅ 完成", jobFailed: "❌ 失败", closeJob: "关闭",
+    jobPhases: "每步成本", jobPhasesNote: "积分仅展示，扣费以总额为准",
+    stagePlanning: "规划", stageReview: "评审", stageDeploy: "部署", jobStuckHere: "卡在这一步",
   },
   en: {
     clients: "Clients", newClient: "＋ New client", clientName: "Client name", background: "Client background / intro",
@@ -59,8 +61,24 @@ const STR = {
     build: "🚀 Build", building: "Submitting…", jobTitle: "Build job", jobState: "State",
     jobProgress: "Progress", jobCurrent: "Current", viewPr: "View PR ↗", viewApp: "Live preview ↗",
     jobDone: "✅ Done", jobFailed: "❌ Failed", closeJob: "Close",
+    jobPhases: "Per-step cost", jobPhasesNote: "credits shown for info; billing uses total",
+    stagePlanning: "Planning", stageReview: "Review", stageDeploy: "Deploy", jobStuckHere: "stuck here",
   },
 } as const;
+
+/**
+ * CC-64:loop-engineer 回传的每步成本明细(与 hack5 phasesTimeline 同口径)。
+ * stage = planning | review | deploy | 任务 id(如 T1);credits = ceil(costUsd×100) 仅展示,
+ * 扣费仍以事件级 costUsd 总额为准(逐节点 ceil 求和会略高于总,别拿 phases 求和去扣费)。
+ * 契约来自 loop /status + W5 回调 body(workbench PR #69 已上线,hack5 PR #77 同款消费)。
+ */
+interface JobPhase {
+  stage: string;
+  costUsd?: number;
+  inputTokens?: number;
+  outputTokens?: number;
+  credits?: number;
+}
 
 interface ProjectDetail {
   client: Client;
@@ -95,6 +113,7 @@ export default function Workbench() {
       jobId: string; clientSlug: string; projectSlug: string; state: string;
       percent?: number; done?: number; total?: number; current?: string;
       prUrl?: string; appUrl?: string; costUsd?: number; error?: string;
+      phases?: JobPhase[];
     } | null
   >(null);
   const t = STR[lang];
@@ -311,6 +330,8 @@ export default function Workbench() {
                 total: j.progress?.total,
                 current: j.progress?.current?.title,
                 prUrl: j.prUrl, appUrl: j.appUrl, costUsd: j.costUsd, error: j.error,
+                // CC-64:phases 边跑边显示;某轮 /status 若未带则保留上次(避免时间线闪烁消失)
+                phases: Array.isArray(j.phases) && j.phases.length ? j.phases : prev.phases,
               }
             : prev,
         );
@@ -491,6 +512,37 @@ export default function Workbench() {
                 </>
               )}
               {job.error && <div className="toast err" style={{ position: "static", marginTop: 6, whiteSpace: "pre-wrap" }}>{job.error}</div>}
+              {/* CC-64:每步成本时间线(节点·花费·≈N 积分);failed 高亮卡住的末步。口径与 hack5 一致 */}
+              {job.phases && job.phases.length > 0 && (
+                <div className="jobphases">
+                  <div className="hint" style={{ marginTop: 8, marginBottom: 2 }}>
+                    {t.jobPhases} <span style={{ opacity: 0.6 }}>· {t.jobPhasesNote}</span>
+                  </div>
+                  {job.phases.map((p, i) => {
+                    const isStuck = job.state === "failed" && i === job.phases!.length - 1;
+                    const label =
+                      p.stage === "planning" ? t.stagePlanning
+                      : p.stage === "review" ? t.stageReview
+                      : p.stage === "deploy" ? t.stageDeploy
+                      : p.stage;
+                    const credits =
+                      typeof p.credits === "number" ? p.credits
+                      : typeof p.costUsd === "number" ? Math.ceil(p.costUsd * 100)
+                      : undefined;
+                    return (
+                      <div key={`${p.stage}-${i}`} className={`jobphase-row${isStuck ? " stuck" : ""}`}>
+                        <span className="jobphase-stage">{label}</span>
+                        <div style={{ flex: 1 }} />
+                        {typeof p.costUsd === "number" && <span className="hint">{fmtCost(p.costUsd)}</span>}
+                        {typeof credits === "number" && (
+                          <span className="jobphase-credits">≈{credits} {lang === "zh" ? "积分" : "cr"}</span>
+                        )}
+                        {isStuck && <span className="jobphase-stuck">⚠ {t.jobStuckHere}</span>}
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
               <div className="jobcard-links">
                 {job.prUrl && <a href={job.prUrl} target="_blank" rel="noreferrer">{t.viewPr}</a>}
                 {job.appUrl && <a href={job.appUrl} target="_blank" rel="noreferrer">{t.viewApp}</a>}
