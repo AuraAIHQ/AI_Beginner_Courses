@@ -65,7 +65,12 @@ interface JobRecord {
   usage: Usage;
   /** Fix B：分节用量(每关键节点花多少/积分/卡点)。随 coding_done/failed 回调 durable 送前端。 */
   phases: PhaseUsage[];
+  /** CC-63 P1 review(#71):task 代际。每起一个 task ++;超时后被放弃的孤儿 task 的 onPhase 回写
+   * 用旧代际,setState 前比对 → 忽略,防孤儿覆盖已推进/终态的 state。 */
+  gen: number;
 }
+
+const isTerminalState = (s: JobState): boolean => s === "done" || s === "failed";
 
 /** 记一个节点的用量到 job(planning / 各任务)。credits 展示用;计费仍以事件级 costUsd 总额为准。 */
 function pushPhase(rec: JobRecord, stage: string, u: Usage): void {
@@ -88,6 +93,10 @@ function clientProjectFromSpecDir(specDir: string): { clientSlug: string; projec
 const registry = new Map<string, JobRecord>();
 
 function setState(rec: JobRecord, state: JobState, patch?: Partial<JobRecord>): void {
+  // CC-63 P1 review(#71):终态单调 —— 一旦 done/failed,忽略中间态回写(如超时后被放弃的孤儿 task
+  // 迟到的 onPhase「coding/reviewing」)。否则会覆盖已终态 + 已发终态回调的 state,破坏 phases/state
+  // 单调向终态的不变量(#67/#69/hack5#77 依赖它)。终态→终态(如兜底再标 failed)仍放行。
+  if (isTerminalState(rec.state) && !isTerminalState(state)) return;
   rec.state = state;
   if (patch) Object.assign(rec, patch);
   rec.updatedAt = new Date().toISOString();
@@ -243,6 +252,18 @@ function jobTimeoutMs(): number {
   return Number.isFinite(n) && n > 0 ? n : DEFAULT;
 }
 
+/** 每-task 超时（默认 15min）。单个 plan/code/review 任务卡死 → 快速判该 task 失败,不拖满 job 超时。 */
+function taskTimeoutMs(): number {
+  const DEFAULT = 15 * 60 * 1000;
+  const n = Number(process.env.LOOP_TASK_TIMEOUT_MS ?? DEFAULT);
+  return Number.isFinite(n) && n > 0 ? n : DEFAULT;
+}
+
+/** 合并 job 级 + task 级中止信号:任一 abort 即中止本 task。 */
+function combineSignals(a: AbortSignal | undefined, b: AbortSignal): AbortSignal {
+  return a ? AbortSignal.any([a, b]) : b;
+}
+
 /** 超时/失败后清理该 repo 遗留的半成品 worktree（尽力而为）。 */
 async function pruneRepoWorktrees(repo?: string): Promise<void> {
   if (!repo) return;
@@ -283,20 +304,39 @@ async function processJob(jobId: string, signal?: AbortSignal): Promise<void> {
     if (!task) break; // 有 pending 但被依赖阻塞
     task.status = "in_progress";
     await saveJob(job);
-    try {
-      const result = await runTask(job, task, config, {
-        onPhase: (phase) => setState(rec, phase),
-        signal,
-      });
+    // CC-63 P1：每-task 硬超时。task 卡死(子进程挂、评审模型不响应)→ runWithTimeout 强制返回,
+    // 不再干等 → 判该 task failed → job 收工判 failed → 一定发 W5 failed 回调(不再悬空)。
+    // review(#71):代际守卫 —— 本 task 领一个代际号;超时被放弃后,孤儿 continuation 迟到的
+    // onPhase 用旧代际(rec.gen 已被下一 task/终态推进)→ 忽略,不覆盖已推进/终态的 state。
+    const myGen = ++rec.gen;
+    const r = await runWithTimeout(
+      (taskSignal) =>
+        runTask(job, task, config, {
+          onPhase: (phase) => {
+            if (rec.gen === myGen) setState(rec, phase);
+          },
+          signal: combineSignals(signal, taskSignal),
+        }),
+      taskTimeoutMs(),
+    );
+    rec.gen++; // task 结束(成功/超时/异常)→ 推进代际,使其孤儿 continuation 的后续 onPhase 失效
+    if (r.timedOut) {
+      task.status = "failed";
+      task.lastResult = `task ${task.id} 超时（${Math.round(taskTimeoutMs() / 60000)}min），已中止`;
+      await saveJob(job);
+      log.err(`任务 ${task.id} 超时`);
+      if (signal?.aborted) break; // job 级超时触发的 → 不再取下一个任务
+    } else if (r.error) {
+      task.status = "failed";
+      task.lastResult = (r.error as Error).message;
+      await saveJob(job);
+      log.err(`任务 ${task.id} 异常：${(r.error as Error).message}`);
+      if (signal?.aborted) break;
+    } else {
+      const result = r.value!;
       rec.usage = add(rec.usage, result.usage); // CC-54：每任务成本累加进 job
       pushPhase(rec, task.id, result.usage); // Fix B：本任务节点成本(coder + 评审 + 返工)
       if (result.prUrl) rec.prUrl = result.prUrl;
-    } catch (e) {
-      task.status = "failed";
-      task.lastResult = (e as Error).message;
-      await saveJob(job);
-      log.err(`任务 ${task.id} 异常：${(e as Error).message}`);
-      if (signal?.aborted) break; // job 超时 → 不再取下一个任务
     }
   }
 
@@ -468,6 +508,7 @@ async function findJobRecord(jobId: string): Promise<JobRecord | undefined> {
     updatedAt: new Date().toISOString(),
     usage: { ...ZERO },
     phases: [],
+    gen: 0,
   };
   if (snap) {
     const snapState = snap.state as JobState;
@@ -560,6 +601,7 @@ async function handlePlan(req: IncomingMessage, res: ServerResponse): Promise<vo
     updatedAt: new Date().toISOString(),
     usage: { ...ZERO },
     phases: [],
+    gen: 0,
   };
   registry.set(jobId, rec);
   void persist(rec);
