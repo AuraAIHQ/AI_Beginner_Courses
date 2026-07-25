@@ -62,8 +62,37 @@ async function main() {
   const { stdout: tracked2 } = await g(dir, "ls-files");
   assert.ok(!tracked2.includes("node_modules/lodash/f0.js"), "已 tracked 的 node_modules 应被 rm --cached 剔除");
 
+  // 4. monorepo:嵌套 node_modules(pr-daemon #66 review 指出 top-anchored 会漏这个)
+  const mono = await fs.mkdtemp(path.join(os.tmpdir(), "gi-mono-"));
+  await g(mono, "init", "-q", "-b", "main");
+  await fs.writeFile(path.join(mono, "README.md"), "# base\n");
+  await g(mono, "add", "-A");
+  await g(mono, "commit", "-q", "-m", "base");
+  await g(mono, "branch", "loop/integration");
+  await g(mono, "checkout", "-q", "loop/integration");
+  // 真实源码在子包 + 子包各自的 node_modules(root 也有一份)
+  await fs.mkdir(path.join(mono, "packages", "foo"), { recursive: true });
+  await fs.writeFile(path.join(mono, "packages", "foo", "index.js"), "export const foo = () => 7;\n");
+  await fs.mkdir(path.join(mono, "packages", "foo", "node_modules", "dep"), { recursive: true });
+  await fs.writeFile(path.join(mono, "packages", "foo", "node_modules", "dep", "x.js"), "z".repeat(3000));
+  await fs.mkdir(path.join(mono, "node_modules", "root-dep"), { recursive: true });
+  await fs.writeFile(path.join(mono, "node_modules", "root-dep", "y.js"), "w".repeat(3000));
+
+  await commitAll(mono, "feat: monorepo work");
+  const { stdout: monoTracked } = await g(mono, "ls-files");
+  assert.ok(!monoTracked.includes("node_modules"), `嵌套+root node_modules 都不该提交,实际:\n${monoTracked}`);
+  assert.ok(monoTracked.includes("packages/foo/index.js"), "子包真实源码应提交");
+
+  const monoReview = await diffAgainst(mono, "loop/integration~1");
+  assert.ok(monoReview.includes("packages/foo/index.js"), "评审 diff 应含子包真实源码");
+  assert.ok(monoReview.includes("foo = () => 7"), "评审 diff 应含子包真实实现");
+  assert.ok(!monoReview.includes("node_modules/dep"), "评审 diff 不该含嵌套 node_modules");
+  assert.ok(!monoReview.includes("root-dep"), "评审 diff 不该含 root node_modules");
+  assert.ok(monoReview.length < 20000, `monorepo 评审 diff 不该被 node_modules 撑爆(${monoReview.length})`);
+
   await fs.rm(dir, { recursive: true, force: true });
-  console.log("🎉 node_modules 根因修复 —— 全部断言通过(commit 不含 vendored、评审 diff 干净、幂等剔除)");
+  await fs.rm(mono, { recursive: true, force: true });
+  console.log("🎉 node_modules 根因修复 —— 全部断言通过(root + monorepo 嵌套都不入 commit/评审 diff、幂等剔除)");
 }
 
 main().catch((e) => {

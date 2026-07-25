@@ -266,10 +266,15 @@ export async function removeWorktree(repo: string, wtPath: string): Promise<void
 // 缺失」误判打回 → 任务假失败(真实故障根因,见 CC-60 stockalert)。
 const VENDOR_DIRS = ["node_modules", ".next", "dist", "build", ".turbo", "coverage", ".venv", "__pycache__", "target"] as const;
 const BASELINE_IGNORES = [...VENDOR_DIRS.map((d) => `${d}/`), ".env", ".env.local", ".env.*.local", "*.log", ".DS_Store"];
-// review diff 的 pathspec：`:/` = 仓库根(含全部)；`:(exclude,top)dir` = 锚定仓库根排除 vendored。
-// 用 top 锚定而非 `.`：`.` 依赖 git 进程 cwd(生产里 server cwd ≠ worktree)会失配 → 排除失效。
+// review diff 的 pathspec：`:/` = 仓库根(含全部)；`:(exclude,glob)**/dir/**` = 排除任意深度的 vendored。
+// 用 glob(而非 `.` 或 `top`)：
+//   - `.` 依赖 git 进程 cwd(生产里 server cwd ≠ worktree)会失配；
+//   - `top` 只锚定仓库根,匹配不到 monorepo 的嵌套 packages/*/node_modules(pr-daemon #66 review 实证)。
+// glob `**/dir/**` 与 .gitignore 的 `dir/` 同义:任意深度都命中。
 const DIFF_INCLUDE_ROOT = ":/";
-const DIFF_EXCLUDES = VENDOR_DIRS.map((d) => `:(exclude,top)${d}`);
+const DIFF_EXCLUDES = VENDOR_DIRS.map((d) => `:(exclude,glob)**/${d}/**`);
+/** `git rm --cached` 用的 glob pathspec:匹配任意深度 vendored 目录下的文件(root + 嵌套)。 */
+const VENDOR_RM_GLOBS = VENDOR_DIRS.map((d) => `:(glob)**/${d}/**`);
 
 /**
  * 确保 worktree 有基线 .gitignore（幂等：只补缺失行）。在首次 commit 前调,防 coder 忘写
@@ -305,12 +310,18 @@ export async function hasChanges(wtPath: string): Promise<boolean> {
   return !!s;
 }
 
+/**
+ * 提交 worktree 全部改动。**有副作用（刻意为之的策略）**：
+ *  1. 首次提交前补一份基线 .gitignore（node_modules/.next/.env 等），防 coder 忘写 → `git add -A`
+ *     把 node_modules 卷进提交/评审 diff（CC-60 假失败根因）。gitignore 的 `dir/` 匹配任意深度。
+ *  2. 把已被 tracked 的 vendored（历史 attempt 提交过的，.gitignore 对已跟踪文件无效）从暂存区剔除，
+ *     含 monorepo 的嵌套 node_modules（glob pathspec，见 VENDOR_RM_GLOBS）。
+ */
 export async function commitAll(wtPath: string, message: string): Promise<boolean> {
-  await ensureGitignore(wtPath); // 先落基线 .gitignore,让 add -A 天然跳过 node_modules 等
+  await ensureGitignore(wtPath); // 先落基线 .gitignore,让 add -A 天然跳过 node_modules 等(含嵌套)
   await git(wtPath, ["add", "-A"]);
-  // 若 vendored 目录在之前的 attempt 已被 tracked(.gitignore 对已跟踪文件无效)→ 从暂存区剔除,
-  // 不进本次 commit,也就不进评审 diff。--ignore-unmatch:没有也不报错。
-  await tryGit(wtPath, ["rm", "-r", "--cached", "--ignore-unmatch", "--", ...VENDOR_DIRS]);
+  // 已 tracked 的 vendored（root + 嵌套）→ 从暂存区剔除,不进本次 commit/评审 diff。--ignore-unmatch:没有也不报错。
+  await tryGit(wtPath, ["rm", "-r", "--cached", "--ignore-unmatch", "--", ...VENDOR_RM_GLOBS]);
   if (!(await hasChanges(wtPath))) return false;
   await git(wtPath, ["commit", "-m", message]);
   return true;
