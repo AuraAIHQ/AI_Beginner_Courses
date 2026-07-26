@@ -57,17 +57,72 @@ async function cfFetch(
   return (await res.json()) as { success: boolean; result?: any; errors?: any[] };
 }
 
-/** 确保 Pages 项目存在（幂等：有则跳过，无则建，生产分支 main）。 */
-async function ensureProject(name: string, cf: CfCreds): Promise<void> {
-  const got = await cfFetch(`/accounts/${cf.accountId}/pages/projects/${name}`, "GET", cf);
-  if (got.success) return;
-  const created = await cfFetch(`/accounts/${cf.accountId}/pages/projects`, "POST", cf, {
-    name,
-    production_branch: "main",
-  });
-  if (!created.success) {
-    throw new Error(`建 Pages 项目失败：${JSON.stringify(created.errors)}`);
+// next-on-pages 出的 Next.js SSR Functions 用 node:* 内置模块,Pages 项目必须开 nodejs_compat +
+// 够新的 compatibility_date,否则运行时 503「no nodejs_compat compatibility flag」(活体实测)。
+// 关键:wrangler v4 `pages deploy` **没有** compat CLI 参数(--compatibility-flags 报 Unknown arguments),
+// 只能走项目级 deployment_configs —— Pages direct-upload 的每次部署继承项目级配置。API PATCH 实测生效
+// (success:True → flags:['nodejs_compat'])。
+// compatibility_date 固定 2025-08-15:codex 指出 2024-11-01 偏旧,部分 Node API 需要更晚日期
+// (process.env 需 ≥2025-04-01、node:http/https 需 ≥2025-08-15),否则真实 app 仍会运行时报错。
+// 固定值(非"今天")保证可复现;升级此日期须配套重跑活体部署验证。
+const COMPAT = { compatibility_date: "2025-08-15", compatibility_flags: ["nodejs_compat"] };
+const DEPLOYMENT_CONFIGS = { production: COMPAT, preview: COMPAT };
+
+/**
+ * 从 CF Pages 项目响应里断言 production 已开 nodejs_compat;不满足则抛。
+ * ultrareview R4:`success:true` **不等于** flag 真生效 —— 必须读回 `result.deployment_configs`
+ * 断言,否则会出现「PATCH 返回成功但 flag 没设上 → 部署 200 但 SSR 运行时 503」的静默坏状态。
+ */
+export function assertNodejsCompat(projectResult: unknown, ctx: string): void {
+  const prod = (
+    projectResult as {
+      deployment_configs?: { production?: { compatibility_flags?: unknown; compatibility_date?: unknown } };
+    } | null
+  )?.deployment_configs?.production;
+  const flags = prod?.compatibility_flags;
+  if (!Array.isArray(flags) || !flags.includes("nodejs_compat")) {
+    throw new Error(
+      `${ctx}:CF 返回 success 但 production.compatibility_flags 未含 nodejs_compat(设置未真正生效)：${JSON.stringify(flags)}`,
+    );
   }
+  // codex(CONFIRMED):光有 flag 不够 —— compatibility_date 太旧同样运行时坏(process.env≥2025-04-01、
+  // node:http/https≥2025-08-15)。断言返回的 date 确实 ≥ 我们设的目标值(ISO 日期字符串比较即序比较)。
+  const date = prod?.compatibility_date;
+  if (typeof date !== "string" || date < COMPAT.compatibility_date) {
+    throw new Error(
+      `${ctx}:production.compatibility_date 未达标(需 ≥${COMPAT.compatibility_date},实为 ${JSON.stringify(date)})——旧日期即便有 flag 仍会运行时报错。`,
+    );
+  }
+}
+
+/**
+ * 确保 Pages 项目存在（幂等）。
+ * - `requireCompat=true`（Next.js SSR）：项目必须开 nodejs_compat,否则 SSR Functions 运行时 503。
+ *   **裸建项目 → 无论新老都 PATCH 设 compat → 读回断言真生效**(新老走同一条已验证机制,消除 R2
+ *   "新建项目路径未测";PATCH/建项目失败或 flag 未生效即硬失败抛错 —— codex 严重1 + R4)。
+ * - `requireCompat=false`（纯静态）：**完全不碰 deployment_configs**(codex 中3:避免覆盖项目已有的
+ *   env vars / KV·D1·R2 绑定;静态站本就用不到 nodejs_compat)。
+ */
+async function ensureProject(name: string, cf: CfCreds, requireCompat: boolean): Promise<void> {
+  const got = await cfFetch(`/accounts/${cf.accountId}/pages/projects/${name}`, "GET", cf);
+  if (!got.success) {
+    // 裸建(不带 deployment_configs)—— compat 统一由下面 PATCH 设 + 断言,新老同一条路径。
+    const created = await cfFetch(`/accounts/${cf.accountId}/pages/projects`, "POST", cf, {
+      name,
+      production_branch: "main",
+    });
+    if (!created.success) {
+      throw new Error(`建 Pages 项目失败：${JSON.stringify(created.errors)}`);
+    }
+  }
+  if (!requireCompat) return; // 纯静态:不碰 deployment_configs
+  const patched = await cfFetch(`/accounts/${cf.accountId}/pages/projects/${name}`, "PATCH", cf, {
+    deployment_configs: DEPLOYMENT_CONFIGS,
+  });
+  if (!patched.success) {
+    throw new Error(`设置 nodejs_compat 失败(Next.js SSR 必需,否则运行时 503)：${JSON.stringify(patched.errors)}`);
+  }
+  assertNodejsCompat(patched.result, "PATCH nodejs_compat"); // R4:success≠生效,读回断言
 }
 
 export interface DeployResult {
@@ -133,8 +188,10 @@ export interface BuildOutcome {
   /** 最终要部署的目录(build 产物,或纯静态时的原目录)。 */
   deployDir: string;
   built: boolean;
-  /** 给用户的提示(如 Next.js SSR 未产出静态目录)。 */
+  /** 给用户的提示(如非-Next 框架 build 后没找到标准产物目录,回退部署源码目录)。 */
   note?: string;
+  /** true=Next.js SSR(部署 .vercel/output/static),项目必须开 nodejs_compat 否则运行时 503。 */
+  requiresNodejsCompat?: boolean;
 }
 
 /**
@@ -191,28 +248,35 @@ export async function buildIfNeeded(dir: string): Promise<BuildOutcome> {
       }
       log.warn("声明 output:export 但未产出 out/,回退 next-on-pages 适配");
     }
-    // 默认 SSR/hybrid(只产 .next,CF Pages 部署不了)→ next-on-pages 适配成兼容产物。
+    // 默认 SSR/hybrid(只产 .next,CF Pages 部署不了)→ @cloudflare/next-on-pages 适配成兼容产物。
+    // npm_config_legacy_peer_deps:容器 npm(10+)默认强制 peer deps,next-on-pages 自身依赖树
+    // (含 @cloudflare/workers-types 版本区间)在严格解析下报 ERESOLVE「unable to resolve dependency tree」
+    // → 装不上、适配失败(活体实测,本地宽松 npm 不报、容器严格 npm 才暴露)。legacy-peer-deps 让 npm
+    // **完全跳过 peerDependencies 校验**绕过 —— 这是**风险可接受的临时绕过**(codex 中6),中期应把 adapter
+    // 依赖树 pin+预装进 Docker 镜像(codex 中5)。版本 pin 到 1.13.16 保证可复现,不用浮动 @1/@latest。
     try {
       log.step("Next.js SSR → @cloudflare/next-on-pages 适配 CF Pages");
-      await pexec("npx", ["--yes", "@cloudflare/next-on-pages@1"], { ...opts, timeout: 480_000 });
+      await pexec("npx", ["--yes", "@cloudflare/next-on-pages@1.13.16"], {
+        ...opts,
+        env: { ...env, npm_config_legacy_peer_deps: "true" },
+        timeout: 480_000,
+      });
     } catch (e) {
+      // codex 严重2:适配失败绝不回退部署源码目录 + 谎报 deployed(那会上线一个 404 的坏 URL)。
+      // 硬失败抛错 → 上层 handleDeploy 返回 500、不发 deployed 回调,让 hack5 如实看到失败。
       const msg = (e as Error).message.slice(0, 300);
-      log.warn(`next-on-pages 适配失败:${msg}`);
-      return {
-        deployDir: dir,
-        built: true,
-        note:
-          "Next.js 应用需 @cloudflare/next-on-pages 适配才能上 CF Pages,本次适配失败" +
-          "(常见:动态路由 / API 路由需声明 `export const runtime = 'edge'`,或改用 next.config 的 " +
-          `output:'export' 静态导出)。适配报错:${msg}`,
-      };
+      throw new Error(
+        "Next.js SSR 应用经 @cloudflare/next-on-pages 适配失败,无法部署到 CF Pages" +
+          "(常见:动态/API 路由需声明 `export const runtime = 'edge'`,或改用 next.config 的 output:'export' 静态导出)。" +
+          `适配报错:${msg}`,
+      );
     }
     const nopOut = path.join(dir, ".vercel", "output", "static");
-    if (await pathExists(nopOut)) {
-      log.ok("Next.js 适配产物:.vercel/output/static");
-      return { deployDir: nopOut, built: true };
+    if (!(await pathExists(nopOut))) {
+      throw new Error("next-on-pages 适配未产出 .vercel/output/static,拒绝部署(避免上线坏产物)。");
     }
-    return { deployDir: dir, built: true, note: "next-on-pages 未产出 .vercel/output/static,回退部署源码目录(可能不可用)。" };
+    log.ok("Next.js 适配产物:.vercel/output/static");
+    return { deployDir: nopOut, built: true, requiresNodejsCompat: true };
   }
 
   await pexec(pm, ["run", "build"], opts);
@@ -221,25 +285,60 @@ export async function buildIfNeeded(dir: string): Promise<BuildOutcome> {
     log.ok(`构建产物目录:${path.relative(dir, found)}`);
     return { deployDir: found, built: true };
   }
-  // 非-Next 框架:build 完成但没找到 out/dist/build 静态产物 → 回退部署源码目录 + 提示。
-  const note = "build 完成但未找到 out/dist/build 等静态产物目录,回退部署源码目录(可能不可用)。";
-  log.warn(note);
-  return { deployDir: dir, built: true, note };
+  // codex(CONFIRMED):build 完成但没找到 out/dist/build/public 静态产物 → **硬失败抛错**,
+  // 不再回退部署源码目录 + 谎报 deployed(那大概率上线一个 404 的坏 URL)。与 SSR 路径同理:失败要诚实。
+  throw new Error(
+    "build 完成但未找到 out/dist/build/.vercel/output/static/public 等静态产物目录,拒绝部署源码目录" +
+      "(避免上线坏产物)。请检查项目 build 脚本的产物输出路径。",
+  );
+}
+
+const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * 部署级冒烟(codex 严重):项目级 compat 断言过 **≠** 本次 deployment 真的起来了(继承时序/传播延迟)。
+ * 轮询 appUrl —— 持续 5xx(含 nodejs_compat 503 / Functions 崩溃)才判失败;非 5xx(2xx/3xx/4xx = 路由/
+ * 鉴权层,说明 Functions 已运行)即放行。仅 SSR(带 Functions)才做,纯静态无此运行时风险。约 28s 上限
+ * (覆盖正常传播,活体实测 <25s 转 200);仍失败即抛,不发 deployed,避免上线坏 URL。
+ */
+async function smokeTestSsr(appUrl: string): Promise<void> {
+  const maxAttempts = 8;
+  const delayMs = 4000;
+  let last = "无响应";
+  for (let i = 0; i < maxAttempts; i++) {
+    try {
+      const res = await fetch(appUrl, { method: "GET", redirect: "manual" });
+      last = `HTTP ${res.status}`;
+      if (res.status < 500) {
+        log.ok(`SSR 部署冒烟通过(${last}):${appUrl}`);
+        return;
+      }
+    } catch (e) {
+      last = `请求异常:${(e as Error).message.slice(0, 80)}`;
+    }
+    if (i < maxAttempts - 1) await sleep(delayMs);
+  }
+  throw new Error(
+    `SSR 部署冒烟失败:${appUrl} 约 ${(maxAttempts * delayMs) / 1000}s 内持续 ${last}` +
+      `(疑似 nodejs_compat 未真正生效 / Functions 运行时崩溃)。拒绝报 deployed,避免上线坏 URL。`,
+  );
 }
 
 /**
  * 把一个静态目录部署到 CF Pages，返回生产 URL（<name>.pages.dev，稳定别名）。
  * 走 npx wrangler pages deploy；token/account 经 env 传给子进程，不进 argv。
+ * SSR 部署额外做一次部署级冒烟(smokeTestSsr),确保运行时真起来了才返回(不谎报 deployed)。
  */
 export async function deployStaticDir(
   dir: string,
   clientSlug: string,
   projectSlug: string,
   cf: CfCreds,
+  requiresNodejsCompat: boolean,
   retentionDays = 7,
 ): Promise<DeployResult> {
   const name = pagesProjectName(clientSlug, projectSlug);
-  await ensureProject(name, cf);
+  await ensureProject(name, cf, requiresNodejsCompat);
   const env = {
     ...process.env,
     CLOUDFLARE_API_TOKEN: cf.token,
@@ -247,11 +346,13 @@ export async function deployStaticDir(
     GIT_TERMINAL_PROMPT: "0",
   };
   log.step(`部署到 CF Pages：${name}（${dir}）`);
+  // nodejs_compat 由 ensureProject 在项目级设(deployment_configs),此次部署继承 —— wrangler v4
+  // pages deploy 没有 compat CLI 参数(见 ensureProject 注释),不能在这里传。
   await pexec(
     "npx",
     [
       "--yes",
-      "wrangler@latest",
+      "wrangler@4.114.0",
       "pages",
       "deploy",
       dir,
@@ -262,6 +363,10 @@ export async function deployStaticDir(
     { env, maxBuffer: 16 * 1024 * 1024, timeout: 180_000 },
   );
   const appUrl = `https://${name}.pages.dev`;
+  // 部署级冒烟(codex 严重):SSR 才验(纯静态无 Functions 运行时风险)。不通过则抛,不发 deployed。
+  if (requiresNodejsCompat) {
+    await smokeTestSsr(appUrl);
+  }
   const expiresAt = new Date(Date.now() + retentionDays * 86400 * 1000).toISOString();
   log.ok(`已部署：${appUrl}（${retentionDays} 天后自动删）`);
   return { appUrl, projectName: name, expiresAt, selfDeployHint: SELF_DEPLOY_HINT };

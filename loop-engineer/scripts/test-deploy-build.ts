@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { buildIfNeeded, findDeployableOutput } from "../src/deploy.js";
+import { buildIfNeeded, findDeployableOutput, assertNodejsCompat } from "../src/deploy.js";
 import { sandboxEnv } from "../src/providers.js";
 
 async function mk(files: Record<string, string>): Promise<string> {
@@ -74,10 +74,40 @@ async function main() {
   assert.equal(buildEnv.PATH, "/usr/bin", "build env 应保留 PATH");
   assert.equal(buildEnv.CI, "1", "build env 应保留构建变量 CI");
 
+  // 5. ultrareview R4 + codex:assertNodejsCompat 读回 result 断言 flag **且** date 真生效(success≠生效)。
+  // 命中:production 同时有 nodejs_compat flag + 够新的 compatibility_date → 不抛。
+  assertNodejsCompat(
+    { deployment_configs: { production: { compatibility_flags: ["nodejs_compat"], compatibility_date: "2025-08-15" } } },
+    "ok",
+  );
+  // 更新的 date 也放行(≥ 目标)
+  assertNodejsCompat(
+    { deployment_configs: { production: { compatibility_flags: ["nodejs_compat"], compatibility_date: "2026-01-01" } } },
+    "ok-newer",
+  );
+  // 未生效的各种形态 → 必须抛(fail-closed):
+  const badResults: [unknown, string][] = [
+    [null, "null result"],
+    [{}, "无 deployment_configs"],
+    [{ deployment_configs: { production: {} } }, "production 无 flags"],
+    [{ deployment_configs: { production: { compatibility_flags: [] } } }, "flags 空数组"],
+    [{ deployment_configs: { production: { compatibility_flags: ["nodejs_als"] } } }, "flags 有别的没 nodejs_compat"],
+    [{ deployment_configs: { preview: { compatibility_flags: ["nodejs_compat"] } } }, "只 preview 设了 production 没设"],
+    // codex(CONFIRMED):有 flag 但 date 旧/缺 → 仍会运行时坏,必须抛
+    [{ deployment_configs: { production: { compatibility_flags: ["nodejs_compat"] } } }, "有 flag 但无 date"],
+    [
+      { deployment_configs: { production: { compatibility_flags: ["nodejs_compat"], compatibility_date: "2024-01-01" } } },
+      "有 flag 但 date 太旧",
+    ],
+  ];
+  for (const [r, why] of badResults) {
+    assert.throws(() => assertNodejsCompat(r, "t"), `未生效应抛：${why}`);
+  }
+
   for (const d of [staticDir, noBuild, noOut, withDist, withOutAndDist, withVercel, withPublic, withDistAndPublic]) {
     await fs.rm(d, { recursive: true, force: true });
   }
-  console.log("🎉 deploy 构建前处理 —— 全部断言通过(纯静态原样、产物目录探测、build env 剥离 secret)");
+  console.log("🎉 deploy 构建前处理 —— 全部断言通过(纯静态原样、产物目录探测、build env 剥离 secret、R4 compat 读回断言)");
 }
 
 main().catch((e) => {
