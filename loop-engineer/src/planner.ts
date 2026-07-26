@@ -28,6 +28,8 @@ async function readSpecDocs(dir: string): Promise<string> {
 }
 
 interface PlanOut {
+  /** 自适应复杂度档:simple=single-shot 一个任务;medium=2-4;complex=按需。仅遥测/日志用,不影响执行。 */
+  complexity?: "simple" | "medium" | "complex";
   tasks: Array<{
     id: string;
     title: string;
@@ -153,6 +155,17 @@ export async function planSpec(
   }
   if (!plan) {
     throw new Error(`所有 planner 均失败(${chain.join("→")})：${lastErr ? lastErr.message : "无可解析任务列表"}`);
+  }
+  // CC-72 自适应:记录 planner 定的复杂度档 vs 实际任务数,便于遥测/校准(过拆/欠拆都能看出来)。
+  const n = plan.tasks.length;
+  if (plan.complexity) {
+    const mismatch =
+      (plan.complexity === "simple" && n > 1) || (plan.complexity === "complex" && n <= 1);
+    log[mismatch ? "warn" : "ok"](
+      `复杂度档=${plan.complexity} → ${n} 个任务${mismatch ? "（档位与任务数不匹配,注意校准）" : ""}`,
+    );
+  } else {
+    log.info(`planner 未标复杂度档 → ${n} 个任务`);
   }
   if (plan.skipped) log.warn(`跳过（未确认）：${plan.skipped}`);
 
