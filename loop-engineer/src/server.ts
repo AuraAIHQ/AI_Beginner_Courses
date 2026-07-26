@@ -40,7 +40,7 @@ import { emitLifecycle, type PhaseUsage } from "./lifecycle.js";
 import { createPool } from "./pool.js";
 import { installCallbackSink } from "./callback.js";
 import { cfCreds, deployStaticDir, buildIfNeeded, cleanupExpiredPages } from "./deploy.js";
-import { normalizePath } from "./routing.js";
+import { routePath } from "./routing.js";
 import { log } from "./log.js";
 import { ZERO, add } from "./usage.js";
 import type { Usage } from "./usage.js";
@@ -784,11 +784,12 @@ async function router(req: IncomingMessage, res: ServerResponse): Promise<void> 
     send(res, 401, { error: "未授权：需要有效的 x-workbench-token" });
     return;
   }
-  const url = new URL(req.url ?? "/", "http://x");
   // CC-69 容错:折叠重复斜杠 + 去尾斜杠再路由。hack5 的 WORKBENCH_LOOP_URL 尾部带 `/` 时会发出
   // `//plan` / `/plan/`,精确匹配 `p === "/plan"` 落空 → 带好 token 也 404(而 /estimate 走另一条
   // 干净构造不受影响,造成"同 host 同 token 唯独 /plan 404"的迷惑现象)。规范化后无论调用方怎么拼都通。
-  const p = normalizePath(url.pathname);
+  // 关键:routePath 不经 `new URL`(它会把 `//plan` 当协议相对 URL,host 变 "plan"、pathname 变 "/",
+  // 双斜杠就漏了),直接从 req.url 剥掉 query/fragment 再折叠斜杠。见 routing.ts。
+  const p = routePath(req.url ?? "/");
   if (req.method === "POST" && p === "/estimate") return handleEstimate(req, res);
   if (req.method === "POST" && p === "/plan") return handlePlan(req, res);
   if (req.method === "POST" && p === "/run") return handleRun(req, res);
