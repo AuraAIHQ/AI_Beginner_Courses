@@ -243,6 +243,43 @@ textarea:focus {
   font-size: 13px;
 }
 
+/* CC-64:每步成本时间线（节点 · 花费 · ≈N 积分；failed 高亮卡住末步） */
+.jobphases {
+  margin-top: 6px;
+  border-top: 1px dashed var(--border);
+  padding-top: 6px;
+}
+.jobphase-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12.5px;
+  padding: 3px 0;
+}
+.jobphase-row + .jobphase-row {
+  border-top: 1px solid var(--border);
+}
+.jobphase-stage {
+  font-family: var(--mono);
+  color: var(--accent);
+}
+.jobphase-credits {
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+.jobphase-row.stuck {
+  background: rgba(255, 107, 107, 0.08);
+  border-radius: 4px;
+  padding: 3px 6px;
+}
+.jobphase-row.stuck .jobphase-stage {
+  color: #ff6b6b;
+}
+.jobphase-stuck {
+  color: #ff6b6b;
+  font-size: 11.5px;
+}
+
 /* 对话 */
 .msg {
   margin-bottom: 14px;
