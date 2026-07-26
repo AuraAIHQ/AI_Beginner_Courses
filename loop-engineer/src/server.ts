@@ -41,6 +41,7 @@ import { createPool } from "./pool.js";
 import { installCallbackSink } from "./callback.js";
 import { cfCreds, deployStaticDir, buildIfNeeded, cleanupExpiredPages } from "./deploy.js";
 import { routePath } from "./routing.js";
+import { genSpec } from "./genspec.js";
 import { log } from "./log.js";
 import { ZERO, add } from "./usage.js";
 import type { Usage } from "./usage.js";
@@ -542,6 +543,38 @@ function deriveState(job: LoadedJob): JobState {
 }
 
 // —— 路由 ——
+/**
+ * POST /genspec —— 共享 spec-gen(CC-69):两前端(fde-copilot/hack5)调同一个端点,把对话/一句话需求
+ * 生成结构化 loop-ready 的 SPEC.md + readiness。无状态:前端传状态进来、拿更新后的 spec 回去存盘/展示。
+ * body: { input, currentSpec?, clientContext?, deliverableContext?, history?, lang? }
+ * → { reply, openQuestions, readiness{score,loop_ready,missing}, spec_markdown, usage }
+ */
+async function handleGenSpec(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const body = await readJson(req);
+  const input = String(body.input ?? "");
+  if (!input.trim()) {
+    send(res, 400, { error: "缺少 input（客户输入 / 一句话需求）" });
+    return;
+  }
+  try {
+    const out = await genSpec(
+      {
+        input,
+        currentSpec: typeof body.currentSpec === "string" ? body.currentSpec : undefined,
+        clientContext: typeof body.clientContext === "string" ? body.clientContext : undefined,
+        deliverableContext: typeof body.deliverableContext === "string" ? body.deliverableContext : undefined,
+        history: typeof body.history === "string" ? body.history : undefined,
+        lang: typeof body.lang === "string" ? body.lang : undefined,
+      },
+      config,
+    );
+    send(res, 200, out);
+  } catch (e) {
+    log.err(`spec-gen 失败：${(e as Error).message}`);
+    send(res, 500, { error: `spec-gen 失败：${(e as Error).message}` });
+  }
+}
+
 async function handlePlan(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const body = await readJson(req);
   const clientSlug = String(body.clientSlug ?? "");
@@ -809,6 +842,7 @@ async function router(req: IncomingMessage, res: ServerResponse): Promise<void> 
   // 双斜杠就漏了),直接从 req.url 剥掉 query/fragment 再折叠斜杠。见 routing.ts。
   const p = routePath(req.url ?? "/");
   if (req.method === "POST" && p === "/estimate") return handleEstimate(req, res);
+  if (req.method === "POST" && p === "/genspec") return handleGenSpec(req, res);
   if (req.method === "POST" && p === "/plan") return handlePlan(req, res);
   if (req.method === "POST" && p === "/run") return handleRun(req, res);
   if (req.method === "POST" && p === "/deploy") return handleDeploy(req, res);
