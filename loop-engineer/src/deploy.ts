@@ -273,6 +273,11 @@ export async function deployStaticDir(
     GIT_TERMINAL_PROMPT: "0",
   };
   log.step(`部署到 CF Pages：${name}（${dir}）`);
+  // --compatibility-flags/date:next-on-pages 出的 Next.js SSR Functions 需 nodejs_compat,否则运行时
+  // 503「no nodejs_compat compatibility flag」。关键:wrangler pages deploy 会**按部署粒度覆盖**项目级
+  // compat 配置(默认 date=今天、flags=空),所以必须在 CLI 直接带上 —— 光靠 ensureProject 的项目级 PATCH
+  // 会被这次 deploy 覆盖掉(wb-nextjs-deploy-test 活体实测:PATCH 后项目仍 flags=[])。日期固定 2024-11-01
+  // (≥2024-09-23 才启用 nodejs_compat)保证可复现。对纯静态部署无副作用(无 Functions 用不到)。
   await pexec(
     "npx",
     [
@@ -284,6 +289,8 @@ export async function deployStaticDir(
       `--project-name=${name}`,
       "--branch=main",
       "--commit-dirty=true",
+      "--compatibility-flags=nodejs_compat",
+      "--compatibility-date=2024-11-01",
     ],
     { env, maxBuffer: 16 * 1024 * 1024, timeout: 180_000 },
   );
