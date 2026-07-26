@@ -191,9 +191,12 @@ export async function planSpec(
     verify: opts.verify
       ? { commands: opts.verify }
       : (existing.verify as object) ?? { commands: [] },
+    // CC-73 重试语义:重跑同 job 时**只保留已 done 的任务**,failed/blocked/in_progress 一律
+    // 重置为 todo → 重新提交同 projectSlug 即自动重试未完成的任务(不重做已成功的)。
+    // (之前 `prevStatus ?? "todo"` 会保留 failed → 失败任务永不再跑、依赖它的后续任务永久卡死。)
     tasks: plan.tasks.map((t) => ({
       ...t,
-      status: prevStatus.get(t.id) ?? "todo",
+      status: prevStatus.get(t.id) === "done" ? "done" : "todo",
     })),
   });
 
