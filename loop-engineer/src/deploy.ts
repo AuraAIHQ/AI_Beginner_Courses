@@ -192,9 +192,17 @@ export async function buildIfNeeded(dir: string): Promise<BuildOutcome> {
       log.warn("声明 output:export 但未产出 out/,回退 next-on-pages 适配");
     }
     // 默认 SSR/hybrid(只产 .next,CF Pages 部署不了)→ next-on-pages 适配成兼容产物。
+    // npm_config_legacy_peer_deps:容器 npm(10+)默认强制 peer deps,而 next-on-pages@1 自身依赖树
+    // (含 @cloudflare/workers-types 版本区间)在严格解析下报 ERESOLVE「unable to resolve dependency tree」
+    // → npx 装不上、适配整个失败(wb-nextjs-deploy-test 活体实测)。legacy-peer-deps 是 ERESOLVE 的标准解:
+    // 放宽 peer 约束、按最近满足版本装,不影响适配产物正确性。本地宽松 npm 不报、容器严格 npm 才暴露。
     try {
       log.step("Next.js SSR → @cloudflare/next-on-pages 适配 CF Pages");
-      await pexec("npx", ["--yes", "@cloudflare/next-on-pages@1"], { ...opts, timeout: 480_000 });
+      await pexec("npx", ["--yes", "@cloudflare/next-on-pages@1"], {
+        ...opts,
+        env: { ...env, npm_config_legacy_peer_deps: "true" },
+        timeout: 480_000,
+      });
     } catch (e) {
       const msg = (e as Error).message.slice(0, 300);
       log.warn(`next-on-pages 适配失败:${msg}`);
