@@ -4,7 +4,7 @@ import { z } from "zod";
 import { query, tool, createSdkMcpServer } from "@anthropic-ai/claude-agent-sdk";
 import type { CanUseTool } from "@anthropic-ai/claude-agent-sdk";
 import { projectDir, readConversation, readClient, readProjectState } from "./clients";
-import type { ConversationEntry, TurnResult, Usage } from "./types";
+import type { ConversationEntry, TurnResult, Usage, OpenQuestion, Readiness } from "./types";
 import { ZERO_USAGE } from "./types";
 
 /**
@@ -365,13 +365,102 @@ SPEC.md 结构(一个文档承载全部)：## 一句话定位 / ## 目标用户 
  * 跑一轮：给定客户新输入，让 agent 读现状→更新文档→调研→抛问题→submit_turn。
  * cwd 锁定为该客户目录，agent 直接就地读写 spec 文档。
  */
+/**
+ * CC-69：走 loop 的**共享** spec-gen 端点 /genspec —— fde-copilot 与 hack5 两个独立前端调同一个,
+ * spec-gen 逻辑只有一份(在 loop)、标准永不漂移。无状态:把 {输入 + 当前 SPEC + 客户/交付物上下文 + 最近对话}
+ * 传给 loop,拿回更新后的结构化 SPEC.md + readiness,本地写盘/展示(与 runTurnDirect 同样的文件 I/O)。
+ */
+async function runTurnViaGenspec(
+  input: RunTurnInput,
+  ctx: {
+    dir: string;
+    history: ConversationEntry[];
+    client: Awaited<ReturnType<typeof readClient>>;
+    project: Awaited<ReturnType<typeof readProjectState>>;
+  },
+): Promise<RunTurnOutput> {
+  const { dir, history, client, project } = ctx;
+  const loopBase = (process.env.LOOP_ENGINEER_URL || "http://localhost:4040").replace(/\/+$/, "");
+  const token = process.env.WORKBENCH_TOKEN?.trim();
+  const specContent = await fs.readFile(path.join(dir, "SPEC.md"), "utf8").catch(() => "");
+  const clientContext = client ? `客户：${client.name}\n${client.background || "（客户未填背景）"}` : "";
+  const deliverableContext = project
+    ? `交付物：${project.deliverable.name}（类型：${project.deliverable.type}）`
+    : "";
+  const headers: Record<string, string> = { "content-type": "application/json" };
+  if (token) headers["x-workbench-token"] = token;
+
+  const res = await fetch(`${loopBase}/genspec`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      input: input.customerInput,
+      currentSpec: specContent,
+      clientContext,
+      deliverableContext,
+      history: recentContext(history),
+      lang: normLang(input.lang),
+    }),
+  });
+  if (!res.ok) throw new Error(`loop /genspec HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`);
+  const d = (await res.json()) as {
+    reply?: string;
+    openQuestions?: OpenQuestion[];
+    readiness?: Readiness;
+    spec_markdown?: string;
+    usage?: { inputTokens?: number; outputTokens?: number; costUsd?: number };
+  };
+  const usage: Usage = {
+    ...ZERO_USAGE,
+    turns: 1,
+    inputTokens: d.usage?.inputTokens ?? 0,
+    outputTokens: d.usage?.outputTokens ?? 0,
+    costUsd: d.usage?.costUsd ?? 0,
+  };
+  if (typeof d.spec_markdown !== "string" || !d.spec_markdown.trim() || !d.reply) {
+    // 未返回结构化结果:兜底不写盘(不覆盖现有 SPEC.md)
+    return {
+      result: {
+        reply: d.reply || "（共享 spec-gen 未返回结构化结果，请重试或补充信息。）",
+        open_questions: d.openQuestions ?? [],
+        research_notes: [],
+        readiness: d.readiness ?? { score: 0, loop_ready: false, missing: ["/genspec 未返回可解析结果"] },
+        updated_docs: [],
+      },
+      usedFallback: true,
+      rawText: JSON.stringify(d).slice(0, 2000),
+      usage,
+    };
+  }
+  const body = d.spec_markdown.endsWith("\n") ? d.spec_markdown : d.spec_markdown + "\n";
+  await fs.writeFile(path.join(dir, "SPEC.md"), body, "utf8");
+  return {
+    result: {
+      reply: d.reply,
+      open_questions: d.openQuestions ?? [],
+      research_notes: [],
+      readiness: d.readiness ?? { score: 0, loop_ready: false, missing: [] },
+      updated_docs: ["SPEC.md"],
+      spec_markdown: d.spec_markdown,
+    },
+    usedFallback: false,
+    rawText: JSON.stringify(d).slice(0, 2000),
+    usage,
+  };
+}
+
 export async function runTurn(input: RunTurnInput): Promise<RunTurnOutput> {
   const dir = projectDir(input.clientSlug, input.projectSlug);
   const history = await readConversation(input.clientSlug, input.projectSlug);
   const client = await readClient(input.clientSlug);
   const project = await readProjectState(input.clientSlug, input.projectSlug);
 
-  // 快 chat「直连」快模型(默认,配了 HILINKUP_API_KEY 时):绕开 agent-sdk 子进程,~11s。
+  // CC-69（默认）：走 loop 共享 /genspec，两前端同一套 spec-gen 标准。USE_SHARED_GENSPEC=false 回退本地直连。
+  if (process.env.USE_SHARED_GENSPEC !== "false") {
+    return runTurnViaGenspec(input, { dir, history, client, project });
+  }
+
+  // 快 chat「直连」快模型(配了 HILINKUP_API_KEY 时):绕开 agent-sdk 子进程,~11s。
   if (process.env.CHAT_FULL_SPEC !== "true" && process.env.HILINKUP_API_KEY && process.env.CHAT_DIRECT !== "false") {
     return runTurnDirect(input, { dir, history, client, project });
   }
