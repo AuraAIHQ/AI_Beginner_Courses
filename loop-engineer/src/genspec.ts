@@ -75,15 +75,29 @@ function systemPrompt(lang?: string): string {
 - spec_markdown: string —— 更新后的**完整** SPEC.md 全文(含上面所有分节)`;
 }
 
-/** chat provider 级联链(复用 planner 的:主选 + LOOP_PLANNER_FALLBACK,均 openai-chat 单发)。 */
+/**
+ * chat provider 级联链(复用 planner 的:主选 + LOOP_PLANNER_FALLBACK)。
+ * **逐个防御式解析**:缺 key / 非 openai-chat 的档跳过(不抛),与 planSpec 一致 —— 否则主选 workers-ai
+ * 在容器缺 CLOUDFLARE_API_TOKEN 时 resolveProvider 直接抛,整条链废掉。降级到 deepseek/hilinkup。
+ */
 function chatChain(config: Config) {
-  const primary = config.providers.planner;
-  const fallbacks = (process.env.LOOP_PLANNER_FALLBACK ?? "deepseek-chat,hilinkup:glm-5.2")
-    .split(",")
-    .map((s) => s.trim())
-    .filter((f) => f && f !== primary);
-  const resolved = [primary, ...fallbacks].map((n) => resolveProvider(n)).filter((p) => p.kind === "openai-chat");
-  if (resolved.length === 0) throw new Error("无可用 chat provider(planner 链为空)");
+  const names = [
+    config.providers.planner,
+    ...(process.env.LOOP_PLANNER_FALLBACK ?? "deepseek-chat,hilinkup:glm-5.2").split(",").map((s) => s.trim()),
+  ].filter(Boolean);
+  const seen = new Set<string>();
+  const resolved = [];
+  for (const n of names) {
+    if (seen.has(n)) continue;
+    seen.add(n);
+    try {
+      const p = resolveProvider(n);
+      if (p.kind === "openai-chat") resolved.push(p);
+    } catch {
+      /* 缺 key / 不可用 → 跳过,降级下一个 */
+    }
+  }
+  if (resolved.length === 0) throw new Error("无可用 chat provider（planner 链全部缺 key / 非 chat）");
   return resolved;
 }
 
