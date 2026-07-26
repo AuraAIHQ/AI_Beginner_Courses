@@ -47,6 +47,22 @@ async function main() {
     "应命中 next-on-pages 的 .vercel/output/static",
   );
 
+  // 3b. pr-daemon #74 回归:public/ 是 Gatsby/Hugo/Eleventy 的构建产物,必须能被探测到。
+  // (Next.js 的 public/ 资产源不会走到这里 —— isNext 分支先处理,故保留 public 不回归 Next。)
+  const withPublic = await mk({ "public/index.html": "gatsby-built" });
+  assert.equal(
+    await findDeployableOutput(withPublic),
+    path.join(withPublic, "public"),
+    "应命中 Gatsby/Hugo 的 public 产物目录",
+  );
+  // 优先级:真正的构建产物 dist 仍应优先于 public(public 是兜底)。
+  const withDistAndPublic = await mk({ "dist/index.html": "d", "public/index.html": "p" });
+  assert.equal(
+    await findDeployableOutput(withDistAndPublic),
+    path.join(withDistAndPublic, "dist"),
+    "dist 应优先于 public",
+  );
+
   // 4. 安全(pr-daemon #68):build 用的 sandboxEnv 必须剥离 secret、保留构建变量。
   const buildEnv = sandboxEnv(
     { PATH: "/usr/bin", HOME: "/root", WORKBENCH_CALLBACK_SECRET: "s", CLOUDFLARE_API_TOKEN: "t", PAGES_CF_TOKEN_THAI_TEA: "p", DEEPSEEK_API_KEY: "k", GITHUB_BOT_TOKEN: "g", WORKBENCH_TOKEN: "w" },
@@ -58,7 +74,7 @@ async function main() {
   assert.equal(buildEnv.PATH, "/usr/bin", "build env 应保留 PATH");
   assert.equal(buildEnv.CI, "1", "build env 应保留构建变量 CI");
 
-  for (const d of [staticDir, noBuild, noOut, withDist, withOutAndDist, withVercel]) {
+  for (const d of [staticDir, noBuild, noOut, withDist, withOutAndDist, withVercel, withPublic, withDistAndPublic]) {
     await fs.rm(d, { recursive: true, force: true });
   }
   console.log("🎉 deploy 构建前处理 —— 全部断言通过(纯静态原样、产物目录探测、build env 剥离 secret)");
