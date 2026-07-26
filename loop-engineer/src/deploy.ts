@@ -57,13 +57,31 @@ async function cfFetch(
   return (await res.json()) as { success: boolean; result?: any; errors?: any[] };
 }
 
-/** 确保 Pages 项目存在（幂等：有则跳过，无则建，生产分支 main）。 */
+// next-on-pages 适配出的 Next.js SSR Functions 依赖 Node.js 兼容层(node:* 内置模块),
+// Pages 项目必须开 nodejs_compat 兼容标志 + 一个够新的 compatibility_date,否则运行时
+// 直接 503「Error - no nodejs_compat compatibility flag」(wb-nextjs-deploy-test 活体实测)。
+// 对纯静态站点无副作用(用不到就闲置),故对所有项目统一开,省得区分。生产/预览都要设。
+const COMPAT = { compatibility_date: "2024-11-01", compatibility_flags: ["nodejs_compat"] };
+const DEPLOYMENT_CONFIGS = { production: COMPAT, preview: COMPAT };
+
+/**
+ * 确保 Pages 项目存在且已开 nodejs_compat（幂等）。
+ * 无则建（带 compat 配置）；有则 PATCH 一次补齐 compat（覆盖历史遗留的没开标志的老项目）。
+ */
 async function ensureProject(name: string, cf: CfCreds): Promise<void> {
   const got = await cfFetch(`/accounts/${cf.accountId}/pages/projects/${name}`, "GET", cf);
-  if (got.success) return;
+  if (got.success) {
+    // 已存在：补齐 compat（老项目可能没设 → SSR 会 503）。PATCH 幂等,失败不致命(记日志继续)。
+    const patched = await cfFetch(`/accounts/${cf.accountId}/pages/projects/${name}`, "PATCH", cf, {
+      deployment_configs: DEPLOYMENT_CONFIGS,
+    });
+    if (!patched.success) log.warn(`Pages 项目 compat 补齐失败(继续部署)：${JSON.stringify(patched.errors)}`);
+    return;
+  }
   const created = await cfFetch(`/accounts/${cf.accountId}/pages/projects`, "POST", cf, {
     name,
     production_branch: "main",
+    deployment_configs: DEPLOYMENT_CONFIGS,
   });
   if (!created.success) {
     throw new Error(`建 Pages 项目失败：${JSON.stringify(created.errors)}`);
