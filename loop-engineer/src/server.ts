@@ -41,6 +41,7 @@ import { createPool } from "./pool.js";
 import { installCallbackSink } from "./callback.js";
 import { cfCreds, deployStaticDir, buildIfNeeded, cleanupExpiredPages } from "./deploy.js";
 import { routePath } from "./routing.js";
+import { genSpec } from "./genspec.js";
 import { log } from "./log.js";
 import { ZERO, add } from "./usage.js";
 import type { Usage } from "./usage.js";
@@ -352,18 +353,38 @@ async function processJob(jobId: string, signal?: AbortSignal): Promise<void> {
       error: `coding 阶段 ${failed.length}/${tasks.length} 个任务失败；首个 ${first.id}：${firstLine}`,
     });
   } else {
-    // W4：远程仓 → 把编码成果回推远程（loop/integration 分支保底 + fast-forward base 便于部署）。
-    // 逐条独立 push：base 若非 FF 失败也不影响 integration 分支落地。凭据来自本机 token，
-    // 沙箱不可见。push 失败不改 job 状态（尽力而为），只告警。
+    // W4：远程仓 → 回推编码成果。CC-69 加固(容错/幂等/友好/不谎报):
+    //  - **integration 分支 = 代码落 GitHub,是「一键应用」的兑现,push 失败 = 硬失败**(不再静默报 done;
+    //    否则 /deploy 部署到空 main、用户以为成功其实代码没上仓)。带**重试**(网络抖动/瞬时 5xx)+ **友好错误**。
+    //  - base fast-forward(便于 /deploy 直接部署 main)是便利项,失败**不致命** —— 代码已在 integration 分支。
+    //  幂等:重跑同 job 会重推,已存在的 ref 幂等更新。凭据来自本机 token,沙箱不可见。
     if (job.remoteUrl) {
       const integ = job.manifest.integrationBranch;
-      const r = await pushRefs(
-        job.repoPath,
-        job.remoteUrl,
-        [`${integ}:refs/heads/${integ}`, `${integ}:${job.manifest.baseBranch}`],
-        loopPushToken(),
-      );
-      (r.pushed ? log.ok : log.warn)(`回推远程 ${job.remoteUrl}：${r.detail}`);
+      const base = job.manifest.baseBranch;
+      const token = loopPushToken();
+      let integPush = { pushed: false, detail: "未尝试" };
+      for (let a = 1; a <= 3; a++) {
+        integPush = await pushRefs(job.repoPath, job.remoteUrl, [`${integ}:refs/heads/${integ}`], token);
+        if (integPush.pushed) break;
+        // pr-daemon #79(非阻塞):退避响应 AbortSignal —— job 被取消就别空等满 6s。
+        if (a < 3 && !signal?.aborted) {
+          log.warn(`回推 ${integ} 失败(第 ${a}/3 次),重试：${integPush.detail}`);
+          await new Promise((r) => setTimeout(r, 2000 * a));
+        } else break;
+      }
+      if (!integPush.pushed) {
+        // 硬失败:代码没上 GitHub,别报 done。友好 reason 回传前端(与 coding 失败同一条通道)。
+        setState(rec, "failed", {
+          error:
+            `代码构建成功,但回推 GitHub 失败、应用代码未上仓：${integPush.detail}。` +
+            `多为 push 凭据对目标仓无写权限或缺失 —— 请检查 loop 的 WORKBENCH_PUSH_TOKEN / GITHUB_BOT_TOKEN 对 ${job.remoteUrl} 的写权限。`,
+        });
+        return;
+      }
+      // base fast-forward:失败仅告警(代码已在 integration 分支,可从该分支部署或手动合并)。
+      const baseFF = await pushRefs(job.repoPath, job.remoteUrl, [`${integ}:${base}`], token);
+      if (baseFF.pushed) log.ok(`回推远程 ${job.remoteUrl}：integration + ${base} 均已 push`);
+      else log.warn(`${base} fast-forward 失败(代码已在 ${integ} 分支,可从该分支部署/手动合并)：${baseFF.detail}`);
     }
     setState(rec, "done");
     // Fix A（CC-57）：终态先把 loop 成本按 project 回写进 fde-copilot state.json，
@@ -389,7 +410,16 @@ async function processJob(jobId: string, signal?: AbortSignal): Promise<void> {
 // —— HTTP 辅助 ——
 async function readJson(req: IncomingMessage): Promise<Record<string, unknown>> {
   const chunks: Buffer[] = [];
-  for await (const c of req) chunks.push(c as Buffer);
+  let total = 0;
+  const MAX_BODY = 2 * 1024 * 1024; // pr-daemon #79:请求体 2MB 上限,防无界缓冲 DoS。超限当空 body(→ 各 handler 400)。
+  for await (const c of req) {
+    total += (c as Buffer).length;
+    if (total > MAX_BODY) {
+      chunks.length = 0;
+      break;
+    }
+    chunks.push(c as Buffer);
+  }
   try {
     return JSON.parse(Buffer.concat(chunks).toString() || "{}");
   } catch {
@@ -542,6 +572,48 @@ function deriveState(job: LoadedJob): JobState {
 }
 
 // —— 路由 ——
+/**
+ * POST /genspec —— 共享 spec-gen(CC-69):两前端(fde-copilot/hack5)调同一个端点,把对话/一句话需求
+ * 生成结构化 loop-ready 的 SPEC.md + readiness。无状态:前端传状态进来、拿更新后的 spec 回去存盘/展示。
+ * body: { input, currentSpec?, clientContext?, deliverableContext?, history?, lang? }
+ * → { reply, openQuestions, readiness{score,loop_ready,missing}, spec_markdown, usage }
+ */
+async function handleGenSpec(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const body = await readJson(req);
+  const input = String(body.input ?? "");
+  if (!input.trim()) {
+    send(res, 400, { error: "缺少 input（客户输入 / 一句话需求）" });
+    return;
+  }
+  // pr-daemon #79:各字段大小上限,别把无界 payload 送进 LLM(成本/超时/滥用防护)。
+  const currentSpec = typeof body.currentSpec === "string" ? body.currentSpec : undefined;
+  const history = typeof body.history === "string" ? body.history : undefined;
+  const clientContext = typeof body.clientContext === "string" ? body.clientContext : undefined;
+  const deliverableContext = typeof body.deliverableContext === "string" ? body.deliverableContext : undefined;
+  const tooBig =
+    input.length > 64 * 1024 ||
+    (currentSpec?.length ?? 0) > 512 * 1024 ||
+    (history?.length ?? 0) > 128 * 1024 ||
+    (clientContext?.length ?? 0) > 32 * 1024 ||
+    (deliverableContext?.length ?? 0) > 8 * 1024;
+  if (tooBig) {
+    send(res, 400, {
+      error: "请求体过大（上限：input 64KB / currentSpec 512KB / history 128KB / clientContext 32KB / deliverableContext 8KB）",
+    });
+    return;
+  }
+  try {
+    const out = await genSpec(
+      { input, currentSpec, clientContext, deliverableContext, history, lang: typeof body.lang === "string" ? body.lang : undefined },
+      config,
+    );
+    send(res, 200, out);
+  } catch (e) {
+    log.err(`spec-gen 失败：${(e as Error).message}`);
+    send(res, 500, { error: `spec-gen 失败：${(e as Error).message}` });
+  }
+}
+
 async function handlePlan(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const body = await readJson(req);
   const clientSlug = String(body.clientSlug ?? "");
@@ -560,21 +632,37 @@ async function handlePlan(req: IncomingMessage, res: ServerResponse): Promise<vo
     send(res, 400, { error: (e as Error).message });
     return;
   }
-  // 内联 spec（"上传现成 spec 一键构建"）：body 带 markdown 全文 `spec` 时，直接写进 specDir 当 SPEC.md，
-  // 无需预先存在规格目录。CC-58 容器拆分后 loop-engineer 读不到 fde-copilot 的 clients 目录，故支持随请求带上。
+  // 内联规格来源（CC-69 契约,fde-copilot 与 hack5 两个独立前端统一遵守）：
+  // loop 与前端是**独立容器、读不到对方文件系统**（CC-58 拆分后的回归根因）,所以规格必须随 /plan 内联。
+  // 三选一容错自愈,优先级从高到低:
+  //   1) spec         —— 现成 markdown 规格,直接写 SPEC.md
+  //   2) idea / conversation —— 前端的对话记录/一句话需求;没生成 spec 也能据此建,planner 会据此拆任务
+  // 都没有且本地无预置规格 → 404 并明确指引前端内联。**幂等**:同 projectSlug 重复调用覆盖 SPEC.md 重建。
   const spec = typeof body.spec === "string" ? body.spec : undefined;
-  if (spec !== undefined) {
-    if (spec.trim().length === 0) {
-      send(res, 400, { error: "spec 为空" });
-      return;
-    }
-    if (spec.length > 512 * 1024) {
-      send(res, 400, { error: "spec 过大（上限 512KB）" });
+  const idea =
+    typeof body.idea === "string"
+      ? body.idea
+      : typeof body.conversation === "string"
+        ? body.conversation
+        : undefined;
+  let specSource: string | undefined;
+  if (spec !== undefined && spec.trim().length > 0) {
+    specSource = spec;
+  } else if (idea !== undefined && idea.trim().length > 0) {
+    specSource = `# 需求规格 · Spec（由前端对话/idea 自动生成 · CC-69 容错）\n\n${idea.trim()}\n`;
+  }
+  if (specSource !== undefined) {
+    if (specSource.length > 512 * 1024) {
+      send(res, 400, { error: "spec/idea 过大（上限 512KB）" });
       return;
     }
     try {
       await fs.mkdir(specDir, { recursive: true });
-      await fs.writeFile(path.join(specDir, "SPEC.md"), spec.endsWith("\n") ? spec : spec + "\n", "utf8");
+      await fs.writeFile(
+        path.join(specDir, "SPEC.md"),
+        specSource.endsWith("\n") ? specSource : specSource + "\n",
+        "utf8",
+      );
     } catch (e) {
       send(res, 500, { error: `写入 spec 失败：${(e as Error).message}` });
       return;
@@ -582,7 +670,9 @@ async function handlePlan(req: IncomingMessage, res: ServerResponse): Promise<vo
   }
   if (!(await exists(specDir))) {
     send(res, 404, {
-      error: `规格目录不存在：${specDir}（未上传 spec 且无预置规格。可在 /plan body 带 spec: <markdown> 内联上传）`,
+      error:
+        `规格目录不存在且未内联规格来源：${specDir}。请在 /plan body 内联 spec:<markdown 全文> ` +
+        `或 idea:<对话记录/一句话需求> 之一（loop 与前端是独立容器,读不到前端文件系统,故规格须随请求带上）。`,
     });
     return;
   }
@@ -791,6 +881,7 @@ async function router(req: IncomingMessage, res: ServerResponse): Promise<void> 
   // 双斜杠就漏了),直接从 req.url 剥掉 query/fragment 再折叠斜杠。见 routing.ts。
   const p = routePath(req.url ?? "/");
   if (req.method === "POST" && p === "/estimate") return handleEstimate(req, res);
+  if (req.method === "POST" && p === "/genspec") return handleGenSpec(req, res);
   if (req.method === "POST" && p === "/plan") return handlePlan(req, res);
   if (req.method === "POST" && p === "/run") return handleRun(req, res);
   if (req.method === "POST" && p === "/deploy") return handleDeploy(req, res);

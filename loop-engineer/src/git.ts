@@ -145,8 +145,17 @@ export async function ensureClone(
   const auth = await buildAuth(remoteUrl, token);
   try {
     if (await isGitRepo(localPath)) {
-      await tryGit(localPath, ["fetch", auth.url, baseBranch], auth.env);
-      return;
+      // 显式 refspec:把远端 baseBranch 强更进本地 origin/baseBranch(URL 形式的裸 `fetch <url> <branch>` 只更
+      // FETCH_HEAD、不更远程跟踪 ref → resolveBaseRef 的 origin/base 拿不到最新)。幂等。
+      const fetched = await tryGit(
+        localPath,
+        ["fetch", auth.url, `+refs/heads/${baseBranch}:refs/remotes/origin/${baseBranch}`],
+        auth.env,
+      );
+      if (fetched !== null) return; // fetch 成功 → origin/base 已是远端最新,基线新鲜有保证
+      // pr-daemon #79 2nd:fetch 失败(auth/网络/远端无此分支)→ **复用的 clone 可能陈旧、freshness 不保证**
+      // → 删掉下面重新 clone(幂等),保证 refs 正确。不 return,落到重建路径。
+      log.warn(`复用 clone 的 base fetch 失败,重建 clone 保证基线新鲜：${localPath}`);
     }
     const exists = await fs
       .access(localPath)
@@ -203,6 +212,26 @@ async function branchExists(repo: string, branch: string): Promise<boolean> {
 }
 
 /**
+ * 防御式解析「基线起点」ref(容错/幂等):本地 baseBranch 缺失或未出生(空仓首 clone / 已存在仓只 fetch 未更新
+ * 本地分支)时,依次退到 origin/base、FETCH_HEAD、HEAD。全都没有 = 仓库无任何提交 → 抛**友好错误**(会成为
+ * 回传给前端的失败 reason)。修 CC-69 E2E:`git branch loop/integration main` 在陈旧/空仓上找不到 main 而挂。
+ */
+async function resolveBaseRef(repo: string, baseBranch: string): Promise<string> {
+  // **优先 origin/baseBranch**(pr-daemon #79 2nd round):ensureClone 用 refspec 把它**强更到远端最新**,是
+  // 最可靠的基线;本地 baseBranch 在**复用的持久化 clone**里可能是上一轮遗留的**陈旧**分支,若先选它会把
+  // 陈旧历史当基线 → 非 force push 到缺失的远端 base 时用错误历史创建坏 base 分支。故 origin/base 在前、本地
+  // 兜底。**不退 FETCH_HEAD / HEAD**(尽力而为的 fetch 可能留陈旧 FETCH_HEAD、或 HEAD 是无关默认分支)。
+  // 两者都没有 = 仓库真的无此分支(空仓/名字不对)。
+  for (const ref of [`origin/${baseBranch}`, baseBranch]) {
+    if (await branchExists(repo, ref)) return ref;
+  }
+  throw new Error(
+    `目标仓库找不到基线分支 ${baseBranch}(origin/${baseBranch} 与本地都没有)——大概率是**空仓库(无任何提交)**` +
+      `或分支名不对。请让前端的建仓/commit 步骤先创建一个初始提交(哪怕只放一个 README),再触发编码。`,
+  );
+}
+
+/**
  * 确保集成分支存在，并为它建一个专用 worktree（合并都在这里做，
  * 目标 repo 的主工作树全程不被 checkout 打扰）。返回集成 worktree 路径。
  */
@@ -214,8 +243,9 @@ export async function ensureIntegrationWorktree(
   const wtPath = path.join(wtRoot(repo), "__integration__");
 
   if (!(await branchExists(repo, integrationBranch))) {
-    await git(repo, ["branch", integrationBranch, baseBranch]);
-    log.ok(`建集成分支 ${integrationBranch}（自 ${baseBranch}）`);
+    const base = await resolveBaseRef(repo, baseBranch); // 容错:优先 origin/base(fetch 强更的最新),本地兜底
+    await git(repo, ["branch", integrationBranch, base]);
+    log.ok(`建集成分支 ${integrationBranch}（自 ${base}）`);
   }
 
   // 已挂载？
