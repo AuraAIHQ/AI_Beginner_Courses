@@ -69,34 +69,49 @@ const COMPAT = { compatibility_date: "2025-08-15", compatibility_flags: ["nodejs
 const DEPLOYMENT_CONFIGS = { production: COMPAT, preview: COMPAT };
 
 /**
+ * 从 CF Pages 项目响应里断言 production 已开 nodejs_compat;不满足则抛。
+ * ultrareview R4:`success:true` **不等于** flag 真生效 —— 必须读回 `result.deployment_configs`
+ * 断言,否则会出现「PATCH 返回成功但 flag 没设上 → 部署 200 但 SSR 运行时 503」的静默坏状态。
+ */
+export function assertNodejsCompat(projectResult: unknown, ctx: string): void {
+  const flags = (
+    projectResult as { deployment_configs?: { production?: { compatibility_flags?: unknown } } } | null
+  )?.deployment_configs?.production?.compatibility_flags;
+  if (!Array.isArray(flags) || !flags.includes("nodejs_compat")) {
+    throw new Error(
+      `${ctx}:CF 返回 success 但 production.compatibility_flags 未含 nodejs_compat(设置未真正生效)：${JSON.stringify(flags)}`,
+    );
+  }
+}
+
+/**
  * 确保 Pages 项目存在（幂等）。
  * - `requireCompat=true`（Next.js SSR）：项目必须开 nodejs_compat,否则 SSR Functions 运行时 503。
- *   建项目带 compat、老项目 PATCH 补齐,且 **PATCH/建项目失败即硬失败抛错**(codex 严重1:绝不能
- *   warn 后继续 → 否则部署返回 200 但线上 503 的静默坏状态)。
+ *   **裸建项目 → 无论新老都 PATCH 设 compat → 读回断言真生效**(新老走同一条已验证机制,消除 R2
+ *   "新建项目路径未测";PATCH/建项目失败或 flag 未生效即硬失败抛错 —— codex 严重1 + R4)。
  * - `requireCompat=false`（纯静态）：**完全不碰 deployment_configs**(codex 中3:避免覆盖项目已有的
  *   env vars / KV·D1·R2 绑定;静态站本就用不到 nodejs_compat)。
  */
 async function ensureProject(name: string, cf: CfCreds, requireCompat: boolean): Promise<void> {
   const got = await cfFetch(`/accounts/${cf.accountId}/pages/projects/${name}`, "GET", cf);
-  if (got.success) {
-    if (requireCompat) {
-      const patched = await cfFetch(`/accounts/${cf.accountId}/pages/projects/${name}`, "PATCH", cf, {
-        deployment_configs: DEPLOYMENT_CONFIGS,
-      });
-      if (!patched.success) {
-        throw new Error(`设置 nodejs_compat 失败(Next.js SSR 必需,否则运行时 503)：${JSON.stringify(patched.errors)}`);
-      }
+  if (!got.success) {
+    // 裸建(不带 deployment_configs)—— compat 统一由下面 PATCH 设 + 断言,新老同一条路径。
+    const created = await cfFetch(`/accounts/${cf.accountId}/pages/projects`, "POST", cf, {
+      name,
+      production_branch: "main",
+    });
+    if (!created.success) {
+      throw new Error(`建 Pages 项目失败：${JSON.stringify(created.errors)}`);
     }
-    return;
   }
-  const created = await cfFetch(`/accounts/${cf.accountId}/pages/projects`, "POST", cf, {
-    name,
-    production_branch: "main",
-    ...(requireCompat ? { deployment_configs: DEPLOYMENT_CONFIGS } : {}),
+  if (!requireCompat) return; // 纯静态:不碰 deployment_configs
+  const patched = await cfFetch(`/accounts/${cf.accountId}/pages/projects/${name}`, "PATCH", cf, {
+    deployment_configs: DEPLOYMENT_CONFIGS,
   });
-  if (!created.success) {
-    throw new Error(`建 Pages 项目失败：${JSON.stringify(created.errors)}`);
+  if (!patched.success) {
+    throw new Error(`设置 nodejs_compat 失败(Next.js SSR 必需,否则运行时 503)：${JSON.stringify(patched.errors)}`);
   }
+  assertNodejsCompat(patched.result, "PATCH nodejs_compat"); // R4:success≠生效,读回断言
 }
 
 export interface DeployResult {
