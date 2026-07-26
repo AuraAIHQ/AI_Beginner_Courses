@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { log } from "./log.js";
 import type { ResolvedProvider } from "./config.js";
 import { ZERO, estimateCost, recordUsage } from "./usage.js";
 import type { Usage } from "./usage.js";
@@ -122,8 +123,18 @@ export async function runAgent(prompt: string, opts: RunAgentOpts): Promise<RunA
   // 本地(非 root)跑不受影响。
   env.IS_SANDBOX = "1";
 
+  // 追踪调试(CC-73):spawn 前记录命令上下文,失败时能对上是哪个任务/provider/目录。
+  log.info(
+    `  spawn coder：claude -p（provider=${provider.name} maxTurns=${maxTurns} cwd=${opts.cwd} tools=${
+      opts.allowedTools?.join("/") ?? "all"
+    }）`,
+  );
   const result = await new Promise<RunAgentResult>((resolve, reject) => {
-    const child = spawn("claude", args, { cwd: opts.cwd, env });
+    // CC-73 根因修复：**stdin 必须 ignore（= `< /dev/null`）**。默认 stdio 会给 child 开一个
+    // 打开但永不写入的 stdin 管道 → claude CLI 在无 TTY 的容器里干等 stdin，3s 后报
+    // "no stdin data received in 3s..." 并以退出码 1 挂掉（flight-guard T3 build_error 实证）。
+    // -p 模式的 prompt 走命令行参数、根本不需要 stdin，ignore 掉最干净。
+    const child = spawn("claude", args, { cwd: opts.cwd, env, stdio: ["ignore", "pipe", "pipe"] });
     let stdout = "";
     let stderr = "";
     const timer = setTimeout(() => {
@@ -150,7 +161,19 @@ export async function runAgent(prompt: string, opts: RunAgentOpts): Promise<RunA
     child.on("close", (code) => {
       cleanup();
       if (code !== 0) {
-        reject(new Error(`供应商 ${provider.name} 退出码 ${code}：${stderr.slice(0, 500)}`));
+        // CC-73 追踪调试:非零退出把**全量** stderr/stdout 尾部打进 loop 日志(不再只留 500 字),
+        // 下次失败能一眼看到真实原因,而不是被良性告警占满截断。
+        log.err(`coder/${provider.name} 退出码 ${code}（cwd=${opts.cwd}）`);
+        log.err(`  stderr(${stderr.length} 字符,尾部):\n${stderr.slice(-2000) || "(空)"}`);
+        if (stdout.trim()) log.err(`  stdout(尾部):\n${stdout.slice(-1000)}`);
+        // 过滤掉已知良性告警行(stdin 提示),避免它排在最前、把真实错误挤出被截断的 reason。
+        const cleaned = stderr
+          .split("\n")
+          .filter((l) => !/no stdin data received|proceeding without it|redirect stdin explicitly|piping from a slow/i.test(l))
+          .join("\n")
+          .trim();
+        const detail = (cleaned || stderr).trim().slice(-600) || "(无 stderr 输出)";
+        reject(new Error(`供应商 ${provider.name} 退出码 ${code}：${detail}`));
         return;
       }
       resolve({ text: extractResult(stdout), provider: provider.name, usage: extractUsage(stdout, provider) });
