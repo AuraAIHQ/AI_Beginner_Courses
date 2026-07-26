@@ -400,18 +400,27 @@ async function runTurnViaGenspec(
     usage?: { inputTokens?: number; outputTokens?: number; costUsd?: number };
   };
   try {
-    const res = await fetch(`${loopBase}/genspec`, {
-      method: "POST",
-      headers,
-      body: JSON.stringify({
-        input: input.customerInput,
-        currentSpec: specForSend,
-        clientContext,
-        deliverableContext,
-        history: recentContext(history),
-        lang: normLang(input.lang),
-      }),
-    });
+    // AbortController + 超时(pr-daemon #79 low):挂死连接(非显式错误)也要中断,否则本轮无限阻塞。
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), Number(process.env.GENSPEC_TIMEOUT_MS ?? 120_000));
+    let res: Response;
+    try {
+      res = await fetch(`${loopBase}/genspec`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          input: input.customerInput,
+          currentSpec: specForSend,
+          clientContext,
+          deliverableContext,
+          history: recentContext(history),
+          lang: normLang(input.lang),
+        }),
+        signal: ctrl.signal,
+      });
+    } finally {
+      clearTimeout(timer);
+    }
     if (!res.ok) throw new Error(`loop /genspec HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`);
     d = await res.json();
   } catch (e) {

@@ -410,7 +410,16 @@ async function processJob(jobId: string, signal?: AbortSignal): Promise<void> {
 // —— HTTP 辅助 ——
 async function readJson(req: IncomingMessage): Promise<Record<string, unknown>> {
   const chunks: Buffer[] = [];
-  for await (const c of req) chunks.push(c as Buffer);
+  let total = 0;
+  const MAX_BODY = 2 * 1024 * 1024; // pr-daemon #79:请求体 2MB 上限,防无界缓冲 DoS。超限当空 body(→ 各 handler 400)。
+  for await (const c of req) {
+    total += (c as Buffer).length;
+    if (total > MAX_BODY) {
+      chunks.length = 0;
+      break;
+    }
+    chunks.push(c as Buffer);
+  }
   try {
     return JSON.parse(Buffer.concat(chunks).toString() || "{}");
   } catch {
