@@ -560,21 +560,37 @@ async function handlePlan(req: IncomingMessage, res: ServerResponse): Promise<vo
     send(res, 400, { error: (e as Error).message });
     return;
   }
-  // 内联 spec（"上传现成 spec 一键构建"）：body 带 markdown 全文 `spec` 时，直接写进 specDir 当 SPEC.md，
-  // 无需预先存在规格目录。CC-58 容器拆分后 loop-engineer 读不到 fde-copilot 的 clients 目录，故支持随请求带上。
+  // 内联规格来源（CC-69 契约,fde-copilot 与 hack5 两个独立前端统一遵守）：
+  // loop 与前端是**独立容器、读不到对方文件系统**（CC-58 拆分后的回归根因）,所以规格必须随 /plan 内联。
+  // 三选一容错自愈,优先级从高到低:
+  //   1) spec         —— 现成 markdown 规格,直接写 SPEC.md
+  //   2) idea / conversation —— 前端的对话记录/一句话需求;没生成 spec 也能据此建,planner 会据此拆任务
+  // 都没有且本地无预置规格 → 404 并明确指引前端内联。**幂等**:同 projectSlug 重复调用覆盖 SPEC.md 重建。
   const spec = typeof body.spec === "string" ? body.spec : undefined;
-  if (spec !== undefined) {
-    if (spec.trim().length === 0) {
-      send(res, 400, { error: "spec 为空" });
-      return;
-    }
-    if (spec.length > 512 * 1024) {
-      send(res, 400, { error: "spec 过大（上限 512KB）" });
+  const idea =
+    typeof body.idea === "string"
+      ? body.idea
+      : typeof body.conversation === "string"
+        ? body.conversation
+        : undefined;
+  let specSource: string | undefined;
+  if (spec !== undefined && spec.trim().length > 0) {
+    specSource = spec;
+  } else if (idea !== undefined && idea.trim().length > 0) {
+    specSource = `# 需求规格 · Spec（由前端对话/idea 自动生成 · CC-69 容错）\n\n${idea.trim()}\n`;
+  }
+  if (specSource !== undefined) {
+    if (specSource.length > 512 * 1024) {
+      send(res, 400, { error: "spec/idea 过大（上限 512KB）" });
       return;
     }
     try {
       await fs.mkdir(specDir, { recursive: true });
-      await fs.writeFile(path.join(specDir, "SPEC.md"), spec.endsWith("\n") ? spec : spec + "\n", "utf8");
+      await fs.writeFile(
+        path.join(specDir, "SPEC.md"),
+        specSource.endsWith("\n") ? specSource : specSource + "\n",
+        "utf8",
+      );
     } catch (e) {
       send(res, 500, { error: `写入 spec 失败：${(e as Error).message}` });
       return;
@@ -582,7 +598,9 @@ async function handlePlan(req: IncomingMessage, res: ServerResponse): Promise<vo
   }
   if (!(await exists(specDir))) {
     send(res, 404, {
-      error: `规格目录不存在：${specDir}（未上传 spec 且无预置规格。可在 /plan body 带 spec: <markdown> 内联上传）`,
+      error:
+        `规格目录不存在且未内联规格来源：${specDir}。请在 /plan body 内联 spec:<markdown 全文> ` +
+        `或 idea:<对话记录/一句话需求> 之一（loop 与前端是独立容器,读不到前端文件系统,故规格须随请求带上）。`,
     });
     return;
   }
