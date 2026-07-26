@@ -10,11 +10,11 @@
 
 之所以路径里出现 `.vercel/output/static`,是因为:
 
-1. Next.js 的官方构建产物用的是 **Vercel Build Output API**(一个**开放规范**,目录名就叫 `.vercel/output/`)——Next.js 是 Vercel 家的框架,`next build` 天然按这个格式吐产物。
-2. `@cloudflare/next-on-pages` 是 **Cloudflare 官方**适配器:它内部跑 `next build` 拿到 `.vercel/output/`,再把其中的 SSR 逻辑**转译成 Cloudflare Pages Functions**(Workers 运行时),静态资产落到 `.vercel/output/static`。
-3. 所以 `.vercel/` 只是「Next.js 标准构建产物的目录名」,是磁盘上的中间产物,**与 Vercel 这个平台/公司无任何运行时关系**。
+1. **Vercel Build Output API** 是一个**开放规范**,产物目录叫 `.vercel/output/`。**更正(codex 指出)**:`next build` 本身只产 `.next`;是 `@cloudflare/next-on-pages`(内部调 `vercel build` / 转换逻辑)把 Next 产物**转换成** `.vercel/output/` 这个 Build Output API 格式。不是 `next build` 直接吐 `.vercel/output`。
+2. `@cloudflare/next-on-pages` 是把 Next 产物搬上 CF Pages 的适配器:产出 `.vercel/output/static`(静态资产)+ Pages Functions(把 SSR 逻辑转成 Workers 运行时)。**重要(codex 指出)**:这个 adapter **已被 Cloudflare 标记 deprecated**,官方现推荐 **Workers + OpenNext(`@opennextjs/cloudflare`)**。我们目前仍用它是历史/权宜路径,长期应迁移(见 §5 Q6)。
+3. 所以 `.vercel/` 只是「Build Output API 的目录名」,是磁盘上的中间产物,**与 Vercel 这个平台/公司无任何运行时关系**。
 
-一句话:**`.vercel/output` = Next.js 的构建产物格式;`@cloudflare/next-on-pages` = 把它搬到 Cloudflare 的搬运工;最终跑在 Cloudflare。**
+一句话:**`.vercel/output` = Build Output API 目录格式(由 adapter 生成);`@cloudflare/next-on-pages` = 把 Next 产物搬到 Cloudflare 的(已废弃的)搬运工;最终跑在 Cloudflare。**
 
 ## 1. loop-engineer 是什么(以及为什么要碰这些)
 
@@ -43,7 +43,7 @@ POST /deploy {clientSlug, projectSlug, repo}
 |---|---|---|
 | 无 `package.json` / 无 `build` 脚本 | 当纯静态,原样部署 | 原目录 |
 | Next.js + `output:'export'` | `next build` | `out/` |
-| **Next.js 默认(SSR)** | **`npx @cloudflare/next-on-pages@1`** | `.vercel/output/static` |
+| **Next.js 默认(SSR)** | **`npx @cloudflare/next-on-pages@1.13.16`**(pin) | `.vercel/output/static` |
 | 其它框架(Vite/CRA/Astro/Gatsby/Hugo…) | `pm run build` | `out`/`dist`/`build`/`public`(按序探测) |
 
 - **不设 `NODE_ENV=production`**:否则跳过 devDependencies,构建工具(tailwind/postcss/vite/next 插件)找不到 → build 挂(#73 修)。
@@ -53,8 +53,8 @@ POST /deploy {clientSlug, projectSlug, repo}
 ### 2.2 deployStaticDir —— 部署到 CF Pages
 
 ```
-ensureProject(name)     ← 幂等确保 Pages 项目存在 + 设 nodejs_compat(见 §3.3)
-npx wrangler@latest pages deploy <dir> --project-name=<name> --branch=main --commit-dirty=true
+ensureProject(name, requireCompat)  ← 幂等确保 Pages 项目存在;SSR 才设 nodejs_compat(见 §3.3/§6)
+npx wrangler@4.114.0 pages deploy <dir> --project-name=<name> --branch=main --commit-dirty=true
 ```
 
 - 凭据:`PAGES_CF_TOKEN_THAI_TEA` + `THAI_TEA_CLIENT_ID`,经 env 传子进程,不进 argv、不过 hack5。
@@ -83,8 +83,9 @@ npx wrangler@latest pages deploy <dir> --project-name=<name> --branch=main --com
   → wrangler **v4.114** 报 `Unknown arguments: compatibility-flags` —— **这个版本的 `pages deploy` 根本没有 compat CLI 参数**(`--help` 只有 project-name/branch/commit-*/skip-caching/no-bundle/upload-source-maps)。整个部署失败。
 - **一度误判**:我以为「wrangler 按部署粒度覆盖项目级 compat」,还去掉了项目级 PATCH —— **是错的**。真相是那几次 `/deploy` 都因 build 慢 + 我 curl 超时而**没跑完**,PATCH 压根没执行,不是被覆盖。
 - **正解(活体验证)**:wrangler v4 pages deploy 无 compat 参数,nodejs_compat **只能在项目级** `deployment_configs` 设,Pages direct-upload 的每次部署**继承**项目级配置。
-  - API 实测:`PATCH /accounts/{acct}/pages/projects/{name}` body `{"deployment_configs":{"production":{"compatibility_flags":["nodejs_compat"],"compatibility_date":"2024-11-01"},"preview":{...}}}` → `success:True` → `flags:['nodejs_compat']`。✅
-  - 故 `ensureProject`:建项目时带 `deployment_configs`;老项目 PATCH 补齐。必须在 wrangler deploy **之前**设,新部署才继承。
+  - API 实测:`PATCH /accounts/{acct}/pages/projects/{name}` body `{"deployment_configs":{"production":{"compatibility_flags":["nodejs_compat"],"compatibility_date":"2025-08-15"},"preview":{...}}}` → `success:True` → `flags:['nodejs_compat']`,且部署后**最新 deployment 确实带 `flags:['nodejs_compat']`**。✅
+  - **caveat(codex 指出)**:「PATCH 后 direct-upload 立即继承」是**活体验证过、但官方文档未明确承诺**的行为,且有传播时序;生产上应在部署后复查 deployment 的 flags,不能盲信。
+  - 故 `ensureProject`:建项目时带 `deployment_configs`;老项目 PATCH 补齐。必须在 wrangler deploy **之前**设,新部署才继承。**PATCH 失败即硬失败**(见 §6)。
 
 ### 三关串起来(端到端已验证 ✅)
 
@@ -113,3 +114,25 @@ npx wrangler@latest pages deploy <dir> --project-name=<name> --branch=main --com
 4. **nodejs_compat 对纯静态部署**统一开真的零副作用吗?
 5. **Next.js 带非-edge 的 API/动态路由**时,next-on-pages 仍会失败 —— 当前兜底是 buildNote + 部署源码目录(404)。是否应改成明确 `built:false` + 不部署坏产物?
 6. **ensureProject 的 PATCH 失败只 log.warn 继续** —— 会导致「部署成功但 SSR 503」的静默坏状态,是否该视作硬失败?
+
+## 6. codex 对抗审阅后的加固(2026-07-26)
+
+把复盘文档 + deploy.ts diff 交 codex(Tier1)对抗审阅,采纳并落地的修复:
+
+| codex 发现 | 处理 | 落地 |
+|---|---|---|
+| **严重1** PATCH 失败只 warn→仍 200+deployed→线上 503 静默坏状态 | ✅ 认 | `ensureProject(requireCompat=true)` 时 PATCH/建项目失败**硬失败抛错**;上层 500、不发 deployed |
+| **严重2** next-on-pages 失败/无产物→回退部署源码目录→200 但 404 | ✅ 认 | SSR 适配失败或未产出 `.vercel/output/static` **硬失败抛错**,绝不部署坏产物/谎报 deployed |
+| **中3** PATCH 可能覆盖项目 env/bindings | ✅ 认 | 只在 `requireCompat=true`(SSR)才碰 `deployment_configs`;纯静态**完全不 PATCH** |
+| **中4** compat_date 2024-11-01 偏旧 | ✅ 认 | 提到 **2025-08-15**(覆盖 process.env≥2025-04-01、node:http/https≥2025-08-15) |
+| **中5** `next-on-pages@1`/`wrangler@latest` 浮动 | ✅ 认 | pin **`@cloudflare/next-on-pages@1.13.16`** + **`wrangler@4.114.0`** |
+| **中6** legacy-peer-deps 注释太武断 | ✅ 认 | 注释改为「风险可接受的临时绕过」,标注中期应 pin+预装 |
+| **轻8** 文档第13行「next build 天然产 .vercel/output」不准确 | ✅ 认 | §0 已更正:next build 只产 .next,adapter 才转成 .vercel/output |
+| **轻9** next-on-pages 已 deprecated | ✅ 认 | §0 标注已废弃,官方推 Workers/OpenNext(见下 §7) |
+| **中3(深合并)/中7(并发互斥)** | ⚠️ 部分认 | wb-* 是一次性项目、不设 bindings、并发概率低,真实风险≈0;记为**已知限制/后续**,未在本 PR 引入深合并/加锁 |
+
+## 7. 架构方向(codex §5 回应 + 待决)
+
+- **应默认绕开 SSR**:参赛者展示型前端优先引导 coder 生成 `output:'export'` 静态站(免 next-on-pages、免 nodejs_compat、免这一切脆弱性),只有明确需要 SSR/API/Server Actions 才走适配。
+- **next-on-pages 已废弃**:长期正确方向是 **Workers + OpenNext(`@opennextjs/cloudflare`)**,但那要重做部署链路、改变「部署到 Pages」的产品假设 —— 需产品决策,不在本 bug-fix PR 范围。
+- **本 PR 定位**:让现有 Pages 路径**可靠 + 失败时诚实**(不再谎报 deployed / 上线坏 URL),不做架构迁移。

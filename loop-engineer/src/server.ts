@@ -761,7 +761,7 @@ async function handleDeploy(req: IncomingMessage, res: ServerResponse): Promise<
     await ensureClone(repo, path.join(tmp, "repo"), "main", loopPushToken());
     // 部署前构建:框架项目(有 build 脚本)→ install+build → 部署产物目录;纯静态 → 原目录。
     const build = await buildIfNeeded(path.join(tmp, "repo"));
-    const result = await deployStaticDir(build.deployDir, clientSlug, projectSlug, cf);
+    const result = await deployStaticDir(build.deployDir, clientSlug, projectSlug, cf, build.requiresNodejsCompat ?? false);
     // 发 deployed 回调(带 appUrl),hack5 翻徽章 + 展示在线链接
     await emitLifecycle({ event: "deployed", clientSlug, projectSlug, repo, appUrl: result.appUrl });
     send(res, 200, { ...result, built: build.built, ...(build.note ? { buildNote: build.note } : {}) });

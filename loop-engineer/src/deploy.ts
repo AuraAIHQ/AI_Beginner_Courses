@@ -61,29 +61,38 @@ async function cfFetch(
 // 够新的 compatibility_date,否则运行时 503「no nodejs_compat compatibility flag」(活体实测)。
 // 关键:wrangler v4 `pages deploy` **没有** compat CLI 参数(--compatibility-flags 报 Unknown arguments),
 // 只能走项目级 deployment_configs —— Pages direct-upload 的每次部署继承项目级配置。API PATCH 实测生效
-// (success:True → flags:['nodejs_compat'])。对纯静态部署无副作用(无 Functions 用不到)。date 固定
-// 2024-11-01(≥2024-09-23 才启用 nodejs_compat)保证可复现。
-const COMPAT = { compatibility_date: "2024-11-01", compatibility_flags: ["nodejs_compat"] };
+// (success:True → flags:['nodejs_compat'])。
+// compatibility_date 固定 2025-08-15:codex 指出 2024-11-01 偏旧,部分 Node API 需要更晚日期
+// (process.env 需 ≥2025-04-01、node:http/https 需 ≥2025-08-15),否则真实 app 仍会运行时报错。
+// 固定值(非"今天")保证可复现;升级此日期须配套重跑活体部署验证。
+const COMPAT = { compatibility_date: "2025-08-15", compatibility_flags: ["nodejs_compat"] };
 const DEPLOYMENT_CONFIGS = { production: COMPAT, preview: COMPAT };
 
 /**
- * 确保 Pages 项目存在且已开 nodejs_compat（幂等）。
- * 无则建（带 compat）；有则 PATCH 补齐(覆盖历史遗留没开标志的老项目)。必须在 deploy 前设,
- * 新部署才继承。PATCH 失败不致命(记日志继续,静态站不受影响)。
+ * 确保 Pages 项目存在（幂等）。
+ * - `requireCompat=true`（Next.js SSR）：项目必须开 nodejs_compat,否则 SSR Functions 运行时 503。
+ *   建项目带 compat、老项目 PATCH 补齐,且 **PATCH/建项目失败即硬失败抛错**(codex 严重1:绝不能
+ *   warn 后继续 → 否则部署返回 200 但线上 503 的静默坏状态)。
+ * - `requireCompat=false`（纯静态）：**完全不碰 deployment_configs**(codex 中3:避免覆盖项目已有的
+ *   env vars / KV·D1·R2 绑定;静态站本就用不到 nodejs_compat)。
  */
-async function ensureProject(name: string, cf: CfCreds): Promise<void> {
+async function ensureProject(name: string, cf: CfCreds, requireCompat: boolean): Promise<void> {
   const got = await cfFetch(`/accounts/${cf.accountId}/pages/projects/${name}`, "GET", cf);
   if (got.success) {
-    const patched = await cfFetch(`/accounts/${cf.accountId}/pages/projects/${name}`, "PATCH", cf, {
-      deployment_configs: DEPLOYMENT_CONFIGS,
-    });
-    if (!patched.success) log.warn(`Pages 项目 nodejs_compat 补齐失败(继续部署)：${JSON.stringify(patched.errors)}`);
+    if (requireCompat) {
+      const patched = await cfFetch(`/accounts/${cf.accountId}/pages/projects/${name}`, "PATCH", cf, {
+        deployment_configs: DEPLOYMENT_CONFIGS,
+      });
+      if (!patched.success) {
+        throw new Error(`设置 nodejs_compat 失败(Next.js SSR 必需,否则运行时 503)：${JSON.stringify(patched.errors)}`);
+      }
+    }
     return;
   }
   const created = await cfFetch(`/accounts/${cf.accountId}/pages/projects`, "POST", cf, {
     name,
     production_branch: "main",
-    deployment_configs: DEPLOYMENT_CONFIGS,
+    ...(requireCompat ? { deployment_configs: DEPLOYMENT_CONFIGS } : {}),
   });
   if (!created.success) {
     throw new Error(`建 Pages 项目失败：${JSON.stringify(created.errors)}`);
@@ -153,8 +162,10 @@ export interface BuildOutcome {
   /** 最终要部署的目录(build 产物,或纯静态时的原目录)。 */
   deployDir: string;
   built: boolean;
-  /** 给用户的提示(如 Next.js SSR 未产出静态目录)。 */
+  /** 给用户的提示(如非-Next 框架 build 后没找到标准产物目录,回退部署源码目录)。 */
   note?: string;
+  /** true=Next.js SSR(部署 .vercel/output/static),项目必须开 nodejs_compat 否则运行时 503。 */
+  requiresNodejsCompat?: boolean;
 }
 
 /**
@@ -211,36 +222,35 @@ export async function buildIfNeeded(dir: string): Promise<BuildOutcome> {
       }
       log.warn("声明 output:export 但未产出 out/,回退 next-on-pages 适配");
     }
-    // 默认 SSR/hybrid(只产 .next,CF Pages 部署不了)→ next-on-pages 适配成兼容产物。
-    // npm_config_legacy_peer_deps:容器 npm(10+)默认强制 peer deps,而 next-on-pages@1 自身依赖树
+    // 默认 SSR/hybrid(只产 .next,CF Pages 部署不了)→ @cloudflare/next-on-pages 适配成兼容产物。
+    // npm_config_legacy_peer_deps:容器 npm(10+)默认强制 peer deps,next-on-pages 自身依赖树
     // (含 @cloudflare/workers-types 版本区间)在严格解析下报 ERESOLVE「unable to resolve dependency tree」
-    // → npx 装不上、适配整个失败(wb-nextjs-deploy-test 活体实测)。legacy-peer-deps 是 ERESOLVE 的标准解:
-    // 放宽 peer 约束、按最近满足版本装,不影响适配产物正确性。本地宽松 npm 不报、容器严格 npm 才暴露。
+    // → 装不上、适配失败(活体实测,本地宽松 npm 不报、容器严格 npm 才暴露)。legacy-peer-deps 让 npm
+    // **完全跳过 peerDependencies 校验**绕过 —— 这是**风险可接受的临时绕过**(codex 中6),中期应把 adapter
+    // 依赖树 pin+预装进 Docker 镜像(codex 中5)。版本 pin 到 1.13.16 保证可复现,不用浮动 @1/@latest。
     try {
       log.step("Next.js SSR → @cloudflare/next-on-pages 适配 CF Pages");
-      await pexec("npx", ["--yes", "@cloudflare/next-on-pages@1"], {
+      await pexec("npx", ["--yes", "@cloudflare/next-on-pages@1.13.16"], {
         ...opts,
         env: { ...env, npm_config_legacy_peer_deps: "true" },
         timeout: 480_000,
       });
     } catch (e) {
+      // codex 严重2:适配失败绝不回退部署源码目录 + 谎报 deployed(那会上线一个 404 的坏 URL)。
+      // 硬失败抛错 → 上层 handleDeploy 返回 500、不发 deployed 回调,让 hack5 如实看到失败。
       const msg = (e as Error).message.slice(0, 300);
-      log.warn(`next-on-pages 适配失败:${msg}`);
-      return {
-        deployDir: dir,
-        built: true,
-        note:
-          "Next.js 应用需 @cloudflare/next-on-pages 适配才能上 CF Pages,本次适配失败" +
-          "(常见:动态路由 / API 路由需声明 `export const runtime = 'edge'`,或改用 next.config 的 " +
-          `output:'export' 静态导出)。适配报错:${msg}`,
-      };
+      throw new Error(
+        "Next.js SSR 应用经 @cloudflare/next-on-pages 适配失败,无法部署到 CF Pages" +
+          "(常见:动态/API 路由需声明 `export const runtime = 'edge'`,或改用 next.config 的 output:'export' 静态导出)。" +
+          `适配报错:${msg}`,
+      );
     }
     const nopOut = path.join(dir, ".vercel", "output", "static");
-    if (await pathExists(nopOut)) {
-      log.ok("Next.js 适配产物:.vercel/output/static");
-      return { deployDir: nopOut, built: true };
+    if (!(await pathExists(nopOut))) {
+      throw new Error("next-on-pages 适配未产出 .vercel/output/static,拒绝部署(避免上线坏产物)。");
     }
-    return { deployDir: dir, built: true, note: "next-on-pages 未产出 .vercel/output/static,回退部署源码目录(可能不可用)。" };
+    log.ok("Next.js 适配产物:.vercel/output/static");
+    return { deployDir: nopOut, built: true, requiresNodejsCompat: true };
   }
 
   await pexec(pm, ["run", "build"], opts);
@@ -264,10 +274,11 @@ export async function deployStaticDir(
   clientSlug: string,
   projectSlug: string,
   cf: CfCreds,
+  requiresNodejsCompat: boolean,
   retentionDays = 7,
 ): Promise<DeployResult> {
   const name = pagesProjectName(clientSlug, projectSlug);
-  await ensureProject(name, cf);
+  await ensureProject(name, cf, requiresNodejsCompat);
   const env = {
     ...process.env,
     CLOUDFLARE_API_TOKEN: cf.token,
@@ -281,7 +292,7 @@ export async function deployStaticDir(
     "npx",
     [
       "--yes",
-      "wrangler@latest",
+      "wrangler@4.114.0",
       "pages",
       "deploy",
       dir,
