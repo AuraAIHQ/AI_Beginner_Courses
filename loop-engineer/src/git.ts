@@ -203,6 +203,21 @@ async function branchExists(repo: string, branch: string): Promise<boolean> {
 }
 
 /**
+ * 防御式解析「基线起点」ref(容错/幂等):本地 baseBranch 缺失或未出生(空仓首 clone / 已存在仓只 fetch 未更新
+ * 本地分支)时,依次退到 origin/base、FETCH_HEAD、HEAD。全都没有 = 仓库无任何提交 → 抛**友好错误**(会成为
+ * 回传给前端的失败 reason)。修 CC-69 E2E:`git branch loop/integration main` 在陈旧/空仓上找不到 main 而挂。
+ */
+async function resolveBaseRef(repo: string, baseBranch: string): Promise<string> {
+  for (const ref of [baseBranch, `origin/${baseBranch}`, "FETCH_HEAD", "HEAD"]) {
+    if (await branchExists(repo, ref)) return ref;
+  }
+  throw new Error(
+    `目标仓库没有可用的基线提交(找不到 ${baseBranch} / origin/${baseBranch} / FETCH_HEAD / HEAD)——` +
+      `大概率是**空仓库(无任何提交)**。请让前端的建仓/commit 步骤先创建一个初始提交(哪怕只放一个 README),再触发编码。`,
+  );
+}
+
+/**
  * 确保集成分支存在，并为它建一个专用 worktree（合并都在这里做，
  * 目标 repo 的主工作树全程不被 checkout 打扰）。返回集成 worktree 路径。
  */
@@ -214,8 +229,9 @@ export async function ensureIntegrationWorktree(
   const wtPath = path.join(wtRoot(repo), "__integration__");
 
   if (!(await branchExists(repo, integrationBranch))) {
-    await git(repo, ["branch", integrationBranch, baseBranch]);
-    log.ok(`建集成分支 ${integrationBranch}（自 ${baseBranch}）`);
+    const base = await resolveBaseRef(repo, baseBranch); // 容错:base 本地缺失/未出生 → 退 origin/FETCH_HEAD/HEAD
+    await git(repo, ["branch", integrationBranch, base]);
+    log.ok(`建集成分支 ${integrationBranch}（自 ${base}）`);
   }
 
   // 已挂载？
