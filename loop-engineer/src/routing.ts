@@ -8,3 +8,12 @@
 export function normalizePath(pathname: string): string {
   return "/" + pathname.split("/").filter(Boolean).join("/");
 }
+
+/**
+ * 从原始 req.url 取规范化路由路径。**不经 `new URL`** —— `new URL("//plan","http://x")` 会把
+ * `//plan` 当协议相对 URL(host="plan"、pathname="/"),双斜杠就漏了。直接剥掉 query(?)/fragment(#)
+ * 再 normalizePath 才能正确处理 `//plan` / `/plan/` / `/plan?x=1`。
+ */
+export function routePath(rawUrl: string): string {
+  return normalizePath(rawUrl.split(/[?#]/, 1)[0]);
+}
