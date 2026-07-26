@@ -390,26 +390,46 @@ async function runTurnViaGenspec(
   const headers: Record<string, string> = { "content-type": "application/json" };
   if (token) headers["x-workbench-token"] = token;
 
-  const res = await fetch(`${loopBase}/genspec`, {
-    method: "POST",
-    headers,
-    body: JSON.stringify({
-      input: input.customerInput,
-      currentSpec: specContent,
-      clientContext,
-      deliverableContext,
-      history: recentContext(history),
-      lang: normLang(input.lang),
-    }),
-  });
-  if (!res.ok) throw new Error(`loop /genspec HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`);
-  const d = (await res.json()) as {
+  // 客户端 cap:server 也有上限,这里先截断避免无谓的大 payload(pr-daemon #79 low)。
+  const specForSend = specContent.length > 512 * 1024 ? specContent.slice(0, 512 * 1024) : specContent;
+  let d: {
     reply?: string;
     openQuestions?: OpenQuestion[];
     readiness?: Readiness;
     spec_markdown?: string;
     usage?: { inputTokens?: number; outputTokens?: number; costUsd?: number };
   };
+  try {
+    const res = await fetch(`${loopBase}/genspec`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        input: input.customerInput,
+        currentSpec: specForSend,
+        clientContext,
+        deliverableContext,
+        history: recentContext(history),
+        lang: normLang(input.lang),
+      }),
+    });
+    if (!res.ok) throw new Error(`loop /genspec HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`);
+    d = await res.json();
+  } catch (e) {
+    // pr-daemon #79(Med):网络/HTTP/解析失败**优雅兜底、不抛** —— 否则 route 返回 500、对话历史留下
+    // 「有客户输入、无 copilot 回复」的不一致态。与 runTurnDirect 的解析失败兜底同样处理(不写盘)。
+    return {
+      result: {
+        reply: `共享 spec-gen 暂时不可用（${(e as Error).message.slice(0, 120)}），本轮未更新规格，请稍后重试。`,
+        open_questions: [],
+        research_notes: [],
+        readiness: { score: 0, loop_ready: false, missing: ["/genspec 调用失败，本轮未更新"] },
+        updated_docs: [],
+      },
+      usedFallback: true,
+      rawText: (e as Error).message.slice(0, 500),
+      usage: { ...ZERO_USAGE, turns: 1 },
+    };
+  }
   const usage: Usage = {
     ...ZERO_USAGE,
     turns: 1,

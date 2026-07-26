@@ -145,7 +145,14 @@ export async function ensureClone(
   const auth = await buildAuth(remoteUrl, token);
   try {
     if (await isGitRepo(localPath)) {
-      await tryGit(localPath, ["fetch", auth.url, baseBranch], auth.env);
+      // 显式 refspec:把远端 baseBranch 更新进本地 origin/baseBranch。URL 形式的裸 `fetch <url> <branch>`
+      // 只更 FETCH_HEAD、不更远程跟踪 ref → resolveBaseRef 的 origin/base 档拿不到最新(pr-daemon #79)。
+      // + 强制、幂等。
+      await tryGit(
+        localPath,
+        ["fetch", auth.url, `+refs/heads/${baseBranch}:refs/remotes/origin/${baseBranch}`],
+        auth.env,
+      );
       return;
     }
     const exists = await fs
@@ -208,12 +215,17 @@ async function branchExists(repo: string, branch: string): Promise<boolean> {
  * 回传给前端的失败 reason)。修 CC-69 E2E:`git branch loop/integration main` 在陈旧/空仓上找不到 main 而挂。
  */
 async function resolveBaseRef(repo: string, baseBranch: string): Promise<string> {
-  for (const ref of [baseBranch, `origin/${baseBranch}`, "FETCH_HEAD", "HEAD"]) {
+  // **只用「同内容」的安全 ref**:本地 baseBranch 或 origin/baseBranch(二者内容一致,仅本地/远程跟踪之别)。
+  // **不退 FETCH_HEAD / HEAD**(pr-daemon #79 blocking):ensureClone 的 fetch 尽力而为、可能留下**陈旧**
+  // FETCH_HEAD,或 HEAD 是无关的克隆默认分支 → 会把错误历史当基线,非 force push 到**缺失**的远端 base 时
+  // 会用错误历史**创建**出坏的 base 分支(正是本修复要处理的空/陈旧仓场景)。ensureClone 已用 refspec 把
+  // origin/baseBranch 更到远端最新,故 origin/base 档可靠。两者都没有 = 仓库真的无此分支(空仓/名字不对)。
+  for (const ref of [baseBranch, `origin/${baseBranch}`]) {
     if (await branchExists(repo, ref)) return ref;
   }
   throw new Error(
-    `目标仓库没有可用的基线提交(找不到 ${baseBranch} / origin/${baseBranch} / FETCH_HEAD / HEAD)——` +
-      `大概率是**空仓库(无任何提交)**。请让前端的建仓/commit 步骤先创建一个初始提交(哪怕只放一个 README),再触发编码。`,
+    `目标仓库找不到基线分支 ${baseBranch}(本地与 origin/${baseBranch} 都没有)——大概率是**空仓库(无任何提交)**` +
+      `或分支名不对。请让前端的建仓/commit 步骤先创建一个初始提交(哪怕只放一个 README),再触发编码。`,
   );
 }
 

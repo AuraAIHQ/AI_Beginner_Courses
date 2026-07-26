@@ -366,10 +366,11 @@ async function processJob(jobId: string, signal?: AbortSignal): Promise<void> {
       for (let a = 1; a <= 3; a++) {
         integPush = await pushRefs(job.repoPath, job.remoteUrl, [`${integ}:refs/heads/${integ}`], token);
         if (integPush.pushed) break;
-        if (a < 3) {
+        // pr-daemon #79(非阻塞):退避响应 AbortSignal —— job 被取消就别空等满 6s。
+        if (a < 3 && !signal?.aborted) {
           log.warn(`回推 ${integ} 失败(第 ${a}/3 次),重试：${integPush.detail}`);
           await new Promise((r) => setTimeout(r, 2000 * a));
-        }
+        } else break;
       }
       if (!integPush.pushed) {
         // 硬失败:代码没上 GitHub,别报 done。友好 reason 回传前端(与 coding 失败同一条通道)。
@@ -575,16 +576,26 @@ async function handleGenSpec(req: IncomingMessage, res: ServerResponse): Promise
     send(res, 400, { error: "缺少 input（客户输入 / 一句话需求）" });
     return;
   }
+  // pr-daemon #79:各字段大小上限,别把无界 payload 送进 LLM(成本/超时/滥用防护)。
+  const currentSpec = typeof body.currentSpec === "string" ? body.currentSpec : undefined;
+  const history = typeof body.history === "string" ? body.history : undefined;
+  const clientContext = typeof body.clientContext === "string" ? body.clientContext : undefined;
+  const deliverableContext = typeof body.deliverableContext === "string" ? body.deliverableContext : undefined;
+  const tooBig =
+    input.length > 64 * 1024 ||
+    (currentSpec?.length ?? 0) > 512 * 1024 ||
+    (history?.length ?? 0) > 128 * 1024 ||
+    (clientContext?.length ?? 0) > 32 * 1024 ||
+    (deliverableContext?.length ?? 0) > 8 * 1024;
+  if (tooBig) {
+    send(res, 400, {
+      error: "请求体过大（上限：input 64KB / currentSpec 512KB / history 128KB / clientContext 32KB / deliverableContext 8KB）",
+    });
+    return;
+  }
   try {
     const out = await genSpec(
-      {
-        input,
-        currentSpec: typeof body.currentSpec === "string" ? body.currentSpec : undefined,
-        clientContext: typeof body.clientContext === "string" ? body.clientContext : undefined,
-        deliverableContext: typeof body.deliverableContext === "string" ? body.deliverableContext : undefined,
-        history: typeof body.history === "string" ? body.history : undefined,
-        lang: typeof body.lang === "string" ? body.lang : undefined,
-      },
+      { input, currentSpec, clientContext, deliverableContext, history, lang: typeof body.lang === "string" ? body.lang : undefined },
       config,
     );
     send(res, 200, out);
