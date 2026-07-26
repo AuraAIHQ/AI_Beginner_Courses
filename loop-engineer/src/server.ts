@@ -353,18 +353,37 @@ async function processJob(jobId: string, signal?: AbortSignal): Promise<void> {
       error: `coding 阶段 ${failed.length}/${tasks.length} 个任务失败；首个 ${first.id}：${firstLine}`,
     });
   } else {
-    // W4：远程仓 → 把编码成果回推远程（loop/integration 分支保底 + fast-forward base 便于部署）。
-    // 逐条独立 push：base 若非 FF 失败也不影响 integration 分支落地。凭据来自本机 token，
-    // 沙箱不可见。push 失败不改 job 状态（尽力而为），只告警。
+    // W4：远程仓 → 回推编码成果。CC-69 加固(容错/幂等/友好/不谎报):
+    //  - **integration 分支 = 代码落 GitHub,是「一键应用」的兑现,push 失败 = 硬失败**(不再静默报 done;
+    //    否则 /deploy 部署到空 main、用户以为成功其实代码没上仓)。带**重试**(网络抖动/瞬时 5xx)+ **友好错误**。
+    //  - base fast-forward(便于 /deploy 直接部署 main)是便利项,失败**不致命** —— 代码已在 integration 分支。
+    //  幂等:重跑同 job 会重推,已存在的 ref 幂等更新。凭据来自本机 token,沙箱不可见。
     if (job.remoteUrl) {
       const integ = job.manifest.integrationBranch;
-      const r = await pushRefs(
-        job.repoPath,
-        job.remoteUrl,
-        [`${integ}:refs/heads/${integ}`, `${integ}:${job.manifest.baseBranch}`],
-        loopPushToken(),
-      );
-      (r.pushed ? log.ok : log.warn)(`回推远程 ${job.remoteUrl}：${r.detail}`);
+      const base = job.manifest.baseBranch;
+      const token = loopPushToken();
+      let integPush = { pushed: false, detail: "未尝试" };
+      for (let a = 1; a <= 3; a++) {
+        integPush = await pushRefs(job.repoPath, job.remoteUrl, [`${integ}:refs/heads/${integ}`], token);
+        if (integPush.pushed) break;
+        if (a < 3) {
+          log.warn(`回推 ${integ} 失败(第 ${a}/3 次),重试：${integPush.detail}`);
+          await new Promise((r) => setTimeout(r, 2000 * a));
+        }
+      }
+      if (!integPush.pushed) {
+        // 硬失败:代码没上 GitHub,别报 done。友好 reason 回传前端(与 coding 失败同一条通道)。
+        setState(rec, "failed", {
+          error:
+            `代码构建成功,但回推 GitHub 失败、应用代码未上仓：${integPush.detail}。` +
+            `多为 push 凭据对目标仓无写权限或缺失 —— 请检查 loop 的 WORKBENCH_PUSH_TOKEN / GITHUB_BOT_TOKEN 对 ${job.remoteUrl} 的写权限。`,
+        });
+        return;
+      }
+      // base fast-forward:失败仅告警(代码已在 integration 分支,可从该分支部署或手动合并)。
+      const baseFF = await pushRefs(job.repoPath, job.remoteUrl, [`${integ}:${base}`], token);
+      if (baseFF.pushed) log.ok(`回推远程 ${job.remoteUrl}：integration + ${base} 均已 push`);
+      else log.warn(`${base} fast-forward 失败(代码已在 ${integ} 分支,可从该分支部署/手动合并)：${baseFF.detail}`);
     }
     setState(rec, "done");
     // Fix A（CC-57）：终态先把 loop 成本按 project 回写进 fde-copilot state.json，
