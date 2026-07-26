@@ -57,17 +57,33 @@ async function cfFetch(
   return (await res.json()) as { success: boolean; result?: any; errors?: any[] };
 }
 
+// next-on-pages 出的 Next.js SSR Functions 用 node:* 内置模块,Pages 项目必须开 nodejs_compat +
+// 够新的 compatibility_date,否则运行时 503「no nodejs_compat compatibility flag」(活体实测)。
+// 关键:wrangler v4 `pages deploy` **没有** compat CLI 参数(--compatibility-flags 报 Unknown arguments),
+// 只能走项目级 deployment_configs —— Pages direct-upload 的每次部署继承项目级配置。API PATCH 实测生效
+// (success:True → flags:['nodejs_compat'])。对纯静态部署无副作用(无 Functions 用不到)。date 固定
+// 2024-11-01(≥2024-09-23 才启用 nodejs_compat)保证可复现。
+const COMPAT = { compatibility_date: "2024-11-01", compatibility_flags: ["nodejs_compat"] };
+const DEPLOYMENT_CONFIGS = { production: COMPAT, preview: COMPAT };
+
 /**
- * 确保 Pages 项目存在（幂等：有则跳过，无则建，生产分支 main）。
- * nodejs_compat 兼容标志不在这里设 —— wrangler pages deploy 会按部署粒度覆盖项目级 compat 配置,
- * 故统一在 deployStaticDir 的 wrangler CLI 用 --compatibility-flags 设(见那里注释)。
+ * 确保 Pages 项目存在且已开 nodejs_compat（幂等）。
+ * 无则建（带 compat）；有则 PATCH 补齐(覆盖历史遗留没开标志的老项目)。必须在 deploy 前设,
+ * 新部署才继承。PATCH 失败不致命(记日志继续,静态站不受影响)。
  */
 async function ensureProject(name: string, cf: CfCreds): Promise<void> {
   const got = await cfFetch(`/accounts/${cf.accountId}/pages/projects/${name}`, "GET", cf);
-  if (got.success) return;
+  if (got.success) {
+    const patched = await cfFetch(`/accounts/${cf.accountId}/pages/projects/${name}`, "PATCH", cf, {
+      deployment_configs: DEPLOYMENT_CONFIGS,
+    });
+    if (!patched.success) log.warn(`Pages 项目 nodejs_compat 补齐失败(继续部署)：${JSON.stringify(patched.errors)}`);
+    return;
+  }
   const created = await cfFetch(`/accounts/${cf.accountId}/pages/projects`, "POST", cf, {
     name,
     production_branch: "main",
+    deployment_configs: DEPLOYMENT_CONFIGS,
   });
   if (!created.success) {
     throw new Error(`建 Pages 项目失败：${JSON.stringify(created.errors)}`);
@@ -259,11 +275,8 @@ export async function deployStaticDir(
     GIT_TERMINAL_PROMPT: "0",
   };
   log.step(`部署到 CF Pages：${name}（${dir}）`);
-  // --compatibility-flags/date:next-on-pages 出的 Next.js SSR Functions 需 nodejs_compat,否则运行时
-  // 503「no nodejs_compat compatibility flag」。关键:wrangler pages deploy 会**按部署粒度覆盖**项目级
-  // compat 配置(默认 date=今天、flags=空),所以必须在 CLI 直接带上 —— 光靠 ensureProject 的项目级 PATCH
-  // 会被这次 deploy 覆盖掉(wb-nextjs-deploy-test 活体实测:PATCH 后项目仍 flags=[])。日期固定 2024-11-01
-  // (≥2024-09-23 才启用 nodejs_compat)保证可复现。对纯静态部署无副作用(无 Functions 用不到)。
+  // nodejs_compat 由 ensureProject 在项目级设(deployment_configs),此次部署继承 —— wrangler v4
+  // pages deploy 没有 compat CLI 参数(见 ensureProject 注释),不能在这里传。
   await pexec(
     "npx",
     [
@@ -275,8 +288,6 @@ export async function deployStaticDir(
       `--project-name=${name}`,
       "--branch=main",
       "--commit-dirty=true",
-      "--compatibility-flags=nodejs_compat",
-      "--compatibility-date=2024-11-01",
     ],
     { env, maxBuffer: 16 * 1024 * 1024, timeout: 180_000 },
   );
