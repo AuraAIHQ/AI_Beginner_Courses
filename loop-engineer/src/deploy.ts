@@ -74,12 +74,23 @@ const DEPLOYMENT_CONFIGS = { production: COMPAT, preview: COMPAT };
  * 断言,否则会出现「PATCH 返回成功但 flag 没设上 → 部署 200 但 SSR 运行时 503」的静默坏状态。
  */
 export function assertNodejsCompat(projectResult: unknown, ctx: string): void {
-  const flags = (
-    projectResult as { deployment_configs?: { production?: { compatibility_flags?: unknown } } } | null
-  )?.deployment_configs?.production?.compatibility_flags;
+  const prod = (
+    projectResult as {
+      deployment_configs?: { production?: { compatibility_flags?: unknown; compatibility_date?: unknown } };
+    } | null
+  )?.deployment_configs?.production;
+  const flags = prod?.compatibility_flags;
   if (!Array.isArray(flags) || !flags.includes("nodejs_compat")) {
     throw new Error(
       `${ctx}:CF 返回 success 但 production.compatibility_flags 未含 nodejs_compat(设置未真正生效)：${JSON.stringify(flags)}`,
+    );
+  }
+  // codex(CONFIRMED):光有 flag 不够 —— compatibility_date 太旧同样运行时坏(process.env≥2025-04-01、
+  // node:http/https≥2025-08-15)。断言返回的 date 确实 ≥ 我们设的目标值(ISO 日期字符串比较即序比较)。
+  const date = prod?.compatibility_date;
+  if (typeof date !== "string" || date < COMPAT.compatibility_date) {
+    throw new Error(
+      `${ctx}:production.compatibility_date 未达标(需 ≥${COMPAT.compatibility_date},实为 ${JSON.stringify(date)})——旧日期即便有 flag 仍会运行时报错。`,
     );
   }
 }
@@ -274,15 +285,49 @@ export async function buildIfNeeded(dir: string): Promise<BuildOutcome> {
     log.ok(`构建产物目录:${path.relative(dir, found)}`);
     return { deployDir: found, built: true };
   }
-  // 非-Next 框架:build 完成但没找到 out/dist/build 静态产物 → 回退部署源码目录 + 提示。
-  const note = "build 完成但未找到 out/dist/build 等静态产物目录,回退部署源码目录(可能不可用)。";
-  log.warn(note);
-  return { deployDir: dir, built: true, note };
+  // codex(CONFIRMED):build 完成但没找到 out/dist/build/public 静态产物 → **硬失败抛错**,
+  // 不再回退部署源码目录 + 谎报 deployed(那大概率上线一个 404 的坏 URL)。与 SSR 路径同理:失败要诚实。
+  throw new Error(
+    "build 完成但未找到 out/dist/build/.vercel/output/static/public 等静态产物目录,拒绝部署源码目录" +
+      "(避免上线坏产物)。请检查项目 build 脚本的产物输出路径。",
+  );
+}
+
+const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * 部署级冒烟(codex 严重):项目级 compat 断言过 **≠** 本次 deployment 真的起来了(继承时序/传播延迟)。
+ * 轮询 appUrl —— 持续 5xx(含 nodejs_compat 503 / Functions 崩溃)才判失败;非 5xx(2xx/3xx/4xx = 路由/
+ * 鉴权层,说明 Functions 已运行)即放行。仅 SSR(带 Functions)才做,纯静态无此运行时风险。约 28s 上限
+ * (覆盖正常传播,活体实测 <25s 转 200);仍失败即抛,不发 deployed,避免上线坏 URL。
+ */
+async function smokeTestSsr(appUrl: string): Promise<void> {
+  const maxAttempts = 8;
+  const delayMs = 4000;
+  let last = "无响应";
+  for (let i = 0; i < maxAttempts; i++) {
+    try {
+      const res = await fetch(appUrl, { method: "GET", redirect: "manual" });
+      last = `HTTP ${res.status}`;
+      if (res.status < 500) {
+        log.ok(`SSR 部署冒烟通过(${last}):${appUrl}`);
+        return;
+      }
+    } catch (e) {
+      last = `请求异常:${(e as Error).message.slice(0, 80)}`;
+    }
+    if (i < maxAttempts - 1) await sleep(delayMs);
+  }
+  throw new Error(
+    `SSR 部署冒烟失败:${appUrl} 约 ${(maxAttempts * delayMs) / 1000}s 内持续 ${last}` +
+      `(疑似 nodejs_compat 未真正生效 / Functions 运行时崩溃)。拒绝报 deployed,避免上线坏 URL。`,
+  );
 }
 
 /**
  * 把一个静态目录部署到 CF Pages，返回生产 URL（<name>.pages.dev，稳定别名）。
  * 走 npx wrangler pages deploy；token/account 经 env 传给子进程，不进 argv。
+ * SSR 部署额外做一次部署级冒烟(smokeTestSsr),确保运行时真起来了才返回(不谎报 deployed)。
  */
 export async function deployStaticDir(
   dir: string,
@@ -318,6 +363,10 @@ export async function deployStaticDir(
     { env, maxBuffer: 16 * 1024 * 1024, timeout: 180_000 },
   );
   const appUrl = `https://${name}.pages.dev`;
+  // 部署级冒烟(codex 严重):SSR 才验(纯静态无 Functions 运行时风险)。不通过则抛,不发 deployed。
+  if (requiresNodejsCompat) {
+    await smokeTestSsr(appUrl);
+  }
   const expiresAt = new Date(Date.now() + retentionDays * 86400 * 1000).toISOString();
   log.ok(`已部署：${appUrl}（${retentionDays} 天后自动删）`);
   return { appUrl, projectName: name, expiresAt, selfDeployHint: SELF_DEPLOY_HINT };

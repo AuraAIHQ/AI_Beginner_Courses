@@ -85,7 +85,8 @@ npx wrangler@4.114.0 pages deploy <dir> --project-name=<name> --branch=main --co
 - **正解(活体验证)**:wrangler v4 pages deploy 无 compat 参数,nodejs_compat **只能在项目级** `deployment_configs` 设,Pages direct-upload 的每次部署**继承**项目级配置。
   - API 实测:`PATCH /accounts/{acct}/pages/projects/{name}` body `{"deployment_configs":{"production":{"compatibility_flags":["nodejs_compat"],"compatibility_date":"2025-08-15"},"preview":{...}}}` → `success:True` → `flags:['nodejs_compat']`,且部署后**最新 deployment 确实带 `flags:['nodejs_compat']`**。✅
   - **caveat(codex 指出)**:「PATCH 后 direct-upload 立即继承」是**活体验证过、但官方文档未明确承诺**的行为,且有传播时序;生产上应在部署后复查 deployment 的 flags,不能盲信。
-  - 故 `ensureProject`:建项目时带 `deployment_configs`;老项目 PATCH 补齐。必须在 wrangler deploy **之前**设,新部署才继承。**PATCH 失败即硬失败**(见 §6)。
+  - 故 `ensureProject`(SSR 路径):**裸建项目 → 无论新老都 PATCH 设 compat → 读回 `result.deployment_configs` 断言 `nodejs_compat` flag + `compatibility_date` 真生效**(新老走同一条已验证机制;`success:true` ≠ 生效)。必须在 wrangler deploy **之前**设,新部署才继承;**PATCH 失败或断言不过即硬失败**(见 §6)。
+  - 部署后再做一次**部署级冒烟**(`smokeTestSsr`:轮询 `appUrl`,持续 5xx 才判失败)—— 项目级设对 ≠ 本次 deployment 真起来,冒烟不过不发 deployed(见 §6)。
 
 ### 三关串起来(端到端已验证 ✅)
 
@@ -136,3 +137,18 @@ npx wrangler@4.114.0 pages deploy <dir> --project-name=<name> --branch=main --co
 - **应默认绕开 SSR**:参赛者展示型前端优先引导 coder 生成 `output:'export'` 静态站(免 next-on-pages、免 nodejs_compat、免这一切脆弱性),只有明确需要 SSR/API/Server Actions 才走适配。
 - **next-on-pages 已废弃**:长期正确方向是 **Workers + OpenNext(`@opennextjs/cloudflare`)**,但那要重做部署链路、改变「部署到 Pages」的产品假设 —— 需产品决策,不在本 bug-fix PR 范围。
 - **本 PR 定位**:让现有 Pages 路径**可靠 + 失败时诚实**(不再谎报 deployed / 上线坏 URL),不做架构迁移。
+
+## 8. ultrareview + codex 二轮加固(2026-07-26)
+
+一轮 ultrareview(R4 阻断)+ 再交 codex 对抗审阅,又采纳落地:
+
+| 发现 | 处理 | 落地 |
+|---|---|---|
+| **R4 阻断** PATCH `success:true` ≠ flag 真生效 | ✅ 认 | `assertNodejsCompat` 读回 `result.deployment_configs.production` 断言 flag;ensureProject 重构裸建→PATCH→断言(新老同路径,顺带闭合 R2「新建路径未测」) |
+| **codex 严重** 只断言项目级 ≠ 本次 deployment 真起来 | ✅ 认 | `smokeTestSsr`:SSR 部署后轮询 appUrl(~28s 上限),持续 5xx 即抛、不发 deployed |
+| **codex 中** 只断言 flag 不断言 compatibility_date(旧 date 仍坏) | ✅ 认 | assertNodejsCompat 加 date ≥ 目标值断言 + 补测试 |
+| **codex 中** 非-Next build 无产物回退源码目录→404 | ✅ 认 | 改**硬失败抛错**,不再回退部署源码 |
+| **codex 轻** 文档与实现不一致(建项目带 configs vs 裸建→PATCH) | ✅ 认 | §3.3 已更正为裸建→PATCH→断言 |
+| **codex 中(PLAUSIBLE)** 已存在项目 production_branch 非 main | ⚠️ 记为已知限制 | wb-* 恒以 production_branch:main 新建,外部改动概率≈0;未加额外断言 |
+
+测试:`test-deploy-build.ts` assertNodejsCompat 覆盖 9 例(2 命中含 date + 7 fail-closed 含 date 旧/缺)。
