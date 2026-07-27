@@ -50,6 +50,9 @@ export function clampReason(s: string, max = 500): string {
 
 /** 构造回调 body（稳定字段序,便于签名/校验）。导出供测试与 hack5 侧对齐。 */
 export function callbackBody(evt: LifecycleEvent): string {
+  // CC-60：单 choke point 截断 error（不论来源:超时/异常/任务失败拼接），契约保证 ≤500 字。
+  // CC-76 缺陷2：reason 与 error 用同一份截断结果回填，只读 reason 的调用方也能拿到人话原因。
+  const clampedError = evt.error ? clampReason(evt.error) : undefined;
   return JSON.stringify({
     event: evt.event,
     clientSlug: evt.clientSlug,
@@ -57,8 +60,7 @@ export function callbackBody(evt: LifecycleEvent): string {
     repo: evt.repo,
     ...(evt.appUrl ? { appUrl: evt.appUrl } : {}),
     ...(evt.prUrl ? { prUrl: evt.prUrl } : {}),
-    // CC-60：单 choke point 截断 error（不论来源:超时/异常/任务失败拼接），契约保证 ≤500 字。
-    ...(evt.error ? { error: clampReason(evt.error) } : {}),
+    ...(clampedError ? { error: clampedError, reason: clampedError } : {}),
     ...(typeof evt.costUsd === "number" ? { costUsd: evt.costUsd } : {}),
     ...(typeof evt.inputTokens === "number" ? { inputTokens: evt.inputTokens } : {}),
     ...(typeof evt.outputTokens === "number" ? { outputTokens: evt.outputTokens } : {}),

@@ -179,6 +179,37 @@ export async function ensureClone(
 }
 
 /**
+ * 建仓预检（CC-76 缺陷1）：远程仓是否存在/可达。`git ls-remote` 只探元数据、不拉对象，
+ * 快且轻，带超时（默认 15s）防 hang。token 走 GIT_ASKPASS（不进 argv/.git/config）。
+ * 返回 { ok, detail }：ok=false 时 detail 已脱敏，供 /plan|/run 同步 4xx 回传，
+ * 免得进后台 job 才在 ensureClone/isGitRepo 处炸、调用方白等一轮轮询。
+ */
+export async function remoteReachable(
+  remoteUrl: string,
+  token?: string,
+  timeoutMs = 15000,
+): Promise<{ ok: boolean; detail: string }> {
+  try {
+    assertAllowedPushHost(remoteUrl); // host 不在白名单 → 直接判不可达（与 clone 同口径）
+  } catch (e) {
+    return { ok: false, detail: (e as Error).message };
+  }
+  const auth = await buildAuth(remoteUrl, token);
+  try {
+    await pexec("git", ["ls-remote", auth.url, "HEAD"], {
+      ...GIT_EXEC_OPTS,
+      env: { ...GIT_EXEC_OPTS.env, ...auth.env },
+      timeout: timeoutMs,
+    });
+    return { ok: true, detail: "ok" };
+  } catch (e) {
+    return { ok: false, detail: redact((e as Error).message, token) };
+  } finally {
+    await auth.cleanup();
+  }
+}
+
+/**
  * 把本地分支 push 回远程若干 refspec（token 走 GIT_ASKPASS，不进 argv/.git/config）。
  * 逐条独立 push：某条失败（如 main 非 fast-forward）不影响其它条落地。
  */

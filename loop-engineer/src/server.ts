@@ -32,7 +32,7 @@ import { loadJob, nextTask, hasPending, saveJob, scanJobs } from "./jobs.js";
 import { planSpec } from "./planner.js";
 import { estimateJob } from "./estimate.js";
 import { runTask } from "./orchestrator.js";
-import { isGitRepo, pruneWorktrees, isRemoteRepo, ensureClone, pushRefs } from "./git.js";
+import { isGitRepo, pruneWorktrees, isRemoteRepo, ensureClone, pushRefs, remoteReachable } from "./git.js";
 import { runWithTimeout } from "./timeout.js";
 import { writeStatus, readStatus } from "./persist.js";
 import { checkWorkbenchToken, checkOrigin } from "./auth.js";
@@ -511,6 +511,24 @@ async function exists(p: string): Promise<boolean> {
   return fs.access(p).then(() => true).catch(() => false);
 }
 
+/**
+ * 建仓预检（CC-76 缺陷1）：/plan、/run 入队前先确认目标 repo 存在/可达，不存在同步返回
+ * 明确 4xx，而不是进后台 job 跑到 ensureClone/isGitRepo 才炸（attempts=0 秒 failed、
+ * 调用方白等一轮轮询才在 status.error 里看到原因）。
+ *   - 远程仓：`git ls-remote` 探可达性（假设已过 assertSafeRepo 白名单）。
+ *   - 本地仓：镜像 loadJob 的路径解析（绝对→原样；相对→相对 specDir），再 isGitRepo。
+ * specDir 即 job 目录（loop.json 落此，manifest.id = basename(specDir)），与 loadJob 一致。
+ */
+async function precheckRepo(repo: string, specDir: string): Promise<{ ok: boolean; detail: string }> {
+  if (isRemoteRepo(repo)) {
+    return remoteReachable(repo, loopPushToken());
+  }
+  const repoPath = path.isAbsolute(repo) ? repo : path.resolve(specDir, repo);
+  return (await isGitRepo(repoPath))
+    ? { ok: true, detail: "ok" }
+    : { ok: false, detail: `目标 repo 不是 git 仓库：${repoPath}` };
+}
+
 // 冷启动可安全恢复的状态：非「运行中」的都可原样恢复
 const RESTART_SAFE = new Set<JobState>(["queued", "done", "failed"]);
 
@@ -632,6 +650,15 @@ async function handlePlan(req: IncomingMessage, res: ServerResponse): Promise<vo
     send(res, 400, { error: (e as Error).message });
     return;
   }
+  // CC-76 缺陷1：建仓预检 —— 目标 repo 不存在/不可达就同步 422，别进后台 job 才炸。
+  // 常见触发：hack5 尚未建仓就直连 loop /plan（建仓是 hack5 participant-repo.ts 的活）。
+  const pre = await precheckRepo(repo, specDir);
+  if (!pre.ok) {
+    send(res, 422, {
+      error: `目标 repo 不存在或不可达，请先建仓再 /plan：${pre.detail}`,
+    });
+    return;
+  }
   // 内联规格来源（CC-69 契约,fde-copilot 与 hack5 两个独立前端统一遵守）：
   // loop 与前端是**独立容器、读不到对方文件系统**（CC-58 拆分后的回归根因）,所以规格必须随 /plan 内联。
   // 三选一容错自愈,优先级从高到低:
@@ -717,6 +744,12 @@ async function handleRun(req: IncomingMessage, res: ServerResponse): Promise<voi
     send(res, 200, { accepted: true, jobId, queuePos: 0 });
     return;
   }
+  // CC-76 缺陷1：入队前建仓预检 —— repo 已消失/不可达就同步 422，不再入队跑到 clone 才炸。
+  const pre = await precheckRepo(rec.repo, rec.specDir);
+  if (!pre.ok) {
+    send(res, 422, { error: `目标 repo 不存在或不可达，请先建仓再 /run：${pre.detail}` });
+    return;
+  }
   if (!pool.isActive(jobId)) {
     setState(rec, "queued");
     enqueue(jobId);
@@ -779,7 +812,9 @@ async function handleStatus(res: ServerResponse, jobId: string): Promise<void> {
     ...(rec.phases.length ? { phases: rec.phases } : {}),
     ...(rec.prUrl ? { prUrl: rec.prUrl } : {}),
     ...(rec.appUrl ? { appUrl: rec.appUrl } : {}),
-    ...(rec.error ? { error: rec.error } : {}),
+    // CC-76 缺陷2：reason 与 error 同源回填 —— 只读 reason 的调用方（hack5 build-status/任何
+    // 轮询端）此前恒拿 null、看不到失败原因；两字段同源，读哪个都能拿到人话原因。
+    ...(rec.error ? { error: rec.error, reason: rec.error } : {}),
   });
 }
 
@@ -853,8 +888,27 @@ async function handleDeploy(req: IncomingMessage, res: ServerResponse): Promise<
     // 部署前构建:框架项目(有 build 脚本)→ install+build → 部署产物目录;纯静态 → 原目录。
     const build = await buildIfNeeded(path.join(tmp, "repo"));
     const result = await deployStaticDir(build.deployDir, clientSlug, projectSlug, cf, build.requiresNodejsCompat ?? false);
-    // 发 deployed 回调(带 appUrl),hack5 翻徽章 + 展示在线链接
-    await emitLifecycle({ event: "deployed", clientSlug, projectSlug, repo, appUrl: result.appUrl });
+    // 发 deployed 回调(带 appUrl),hack5 翻徽章 + 展示在线链接。
+    // CC-76 缺陷2：deployed 回调**自带本次 build 成本**(costUsd/tokens/phases,取自 jobId=projectSlug 的
+    // job record)。让「谁部署谁带 cost」—— hack5 settleBuildCost 可直接从这条回调结算,不必再拉
+    // /api/usage(mini 直连 loop 后,fde 从不注册 mini client、也不经 fde 跑 build,该路径结构性 404、
+    // 拉不到 mini 成本,是预扣永远卡 reserved 的真因)。job record 缺失(容器重启丢态)时优雅省略,不阻断部署。
+    const jobRec = await findJobRecord(projectSlug).catch(() => null);
+    await emitLifecycle({
+      event: "deployed",
+      clientSlug,
+      projectSlug,
+      repo,
+      appUrl: result.appUrl,
+      ...(jobRec
+        ? {
+            costUsd: jobRec.usage.costUsd,
+            inputTokens: jobRec.usage.inputTokens,
+            outputTokens: jobRec.usage.outputTokens,
+            ...(jobRec.phases.length ? { phases: jobRec.phases } : {}),
+          }
+        : {}),
+    });
     send(res, 200, { ...result, built: build.built, ...(build.note ? { buildNote: build.note } : {}) });
   } catch (e) {
     log.err(`部署失败(${clientSlug}/${projectSlug})：${(e as Error).message}`);
