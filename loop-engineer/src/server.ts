@@ -888,8 +888,27 @@ async function handleDeploy(req: IncomingMessage, res: ServerResponse): Promise<
     // 部署前构建:框架项目(有 build 脚本)→ install+build → 部署产物目录;纯静态 → 原目录。
     const build = await buildIfNeeded(path.join(tmp, "repo"));
     const result = await deployStaticDir(build.deployDir, clientSlug, projectSlug, cf, build.requiresNodejsCompat ?? false);
-    // 发 deployed 回调(带 appUrl),hack5 翻徽章 + 展示在线链接
-    await emitLifecycle({ event: "deployed", clientSlug, projectSlug, repo, appUrl: result.appUrl });
+    // 发 deployed 回调(带 appUrl),hack5 翻徽章 + 展示在线链接。
+    // CC-76 缺陷2：deployed 回调**自带本次 build 成本**(costUsd/tokens/phases,取自 jobId=projectSlug 的
+    // job record)。让「谁部署谁带 cost」—— hack5 settleBuildCost 可直接从这条回调结算,不必再拉
+    // /api/usage(mini 直连 loop 后,fde 从不注册 mini client、也不经 fde 跑 build,该路径结构性 404、
+    // 拉不到 mini 成本,是预扣永远卡 reserved 的真因)。job record 缺失(容器重启丢态)时优雅省略,不阻断部署。
+    const jobRec = await findJobRecord(projectSlug).catch(() => null);
+    await emitLifecycle({
+      event: "deployed",
+      clientSlug,
+      projectSlug,
+      repo,
+      appUrl: result.appUrl,
+      ...(jobRec
+        ? {
+            costUsd: jobRec.usage.costUsd,
+            inputTokens: jobRec.usage.inputTokens,
+            outputTokens: jobRec.usage.outputTokens,
+            ...(jobRec.phases.length ? { phases: jobRec.phases } : {}),
+          }
+        : {}),
+    });
     send(res, 200, { ...result, built: build.built, ...(build.note ? { buildNote: build.note } : {}) });
   } catch (e) {
     log.err(`部署失败(${clientSlug}/${projectSlug})：${(e as Error).message}`);
