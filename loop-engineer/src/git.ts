@@ -243,6 +243,34 @@ async function branchExists(repo: string, branch: string): Promise<boolean> {
 }
 
 /**
+ * CC-79 断点续跑:best-effort 把远端某分支强更到本地 `origin/<branch>`(供续跑时从它播种 integration +
+ * 读回持久状态)。远端无此分支(全新构建)→ 静默返回 false,不影响正常流程。token 走 GIT_ASKPASS。
+ */
+export async function fetchRemoteBranch(
+  repo: string,
+  remoteUrl: string,
+  branch: string,
+  token?: string,
+): Promise<boolean> {
+  const auth = await buildAuth(remoteUrl, token);
+  try {
+    const r = await tryGit(
+      repo,
+      ["fetch", auth.url, `+refs/heads/${branch}:refs/remotes/origin/${branch}`],
+      auth.env,
+    );
+    return r !== null;
+  } finally {
+    await auth.cleanup();
+  }
+}
+
+/** CC-79:读某 git ref 下某文件的内容(`git show <ref>:<path>`)。文件/ref 不存在返回 null。 */
+export async function showFileAtRef(repo: string, ref: string, filePath: string): Promise<string | null> {
+  return tryGit(repo, ["show", `${ref}:${filePath}`]);
+}
+
+/**
  * 防御式解析「基线起点」ref(容错/幂等):本地 baseBranch 缺失或未出生(空仓首 clone / 已存在仓只 fetch 未更新
  * 本地分支)时,依次退到 origin/base、FETCH_HEAD、HEAD。全都没有 = 仓库无任何提交 → 抛**友好错误**(会成为
  * 回传给前端的失败 reason)。修 CC-69 E2E:`git branch loop/integration main` 在陈旧/空仓上找不到 main 而挂。
@@ -274,9 +302,15 @@ export async function ensureIntegrationWorktree(
   const wtPath = path.join(wtRoot(repo), "__integration__");
 
   if (!(await branchExists(repo, integrationBranch))) {
-    const base = await resolveBaseRef(repo, baseBranch); // 容错:优先 origin/base(fetch 强更的最新),本地兜底
-    await git(repo, ["branch", integrationBranch, base]);
-    log.ok(`建集成分支 ${integrationBranch}（自 ${base}）`);
+    // CC-79 断点续跑:若远端已有该集成分支(上次 checkpoint 推的,含已完成 task 的代码 + `.loop/loop.json`
+    // 状态),**优先自它播种**——这样容器重启/重部署后重建的 integration 直接带上断点,续跑从真实代码继续,
+    // 而不是从 base 从零重来。远端没有(全新构建)→ 退回 base(原行为,向后兼容)。
+    // 调用方(processJob 的 restoreDurableCheckpoint)在此之前已 fetch 过 origin/<integrationBranch>。
+    const seed = (await branchExists(repo, `origin/${integrationBranch}`))
+      ? `origin/${integrationBranch}`
+      : await resolveBaseRef(repo, baseBranch); // 容错:优先 origin/base(fetch 强更的最新),本地兜底
+    await git(repo, ["branch", integrationBranch, seed]);
+    log.ok(`建集成分支 ${integrationBranch}（自 ${seed}）`);
   }
 
   // 已挂载？

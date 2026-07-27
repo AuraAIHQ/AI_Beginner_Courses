@@ -32,7 +32,18 @@ import { loadJob, nextTask, hasPending, saveJob, scanJobs } from "./jobs.js";
 import { planSpec } from "./planner.js";
 import { estimateJob } from "./estimate.js";
 import { runTask } from "./orchestrator.js";
-import { isGitRepo, pruneWorktrees, isRemoteRepo, ensureClone, pushRefs, remoteReachable } from "./git.js";
+import {
+  isGitRepo,
+  pruneWorktrees,
+  isRemoteRepo,
+  ensureClone,
+  pushRefs,
+  remoteReachable,
+  ensureIntegrationWorktree,
+  commitAll,
+  fetchRemoteBranch,
+  showFileAtRef,
+} from "./git.js";
 import { runWithTimeout } from "./timeout.js";
 import { writeStatus, readStatus } from "./persist.js";
 import { checkWorkbenchToken, checkOrigin } from "./auth.js";
@@ -276,6 +287,63 @@ async function pruneRepoWorktrees(repo?: string): Promise<void> {
   }
 }
 
+/**
+ * CC-79 断点续跑 · 写侧:每完成一个 task 就把「集成分支代码 + task 状态(.loop/loop.json)」推到远程作品仓，
+ * 让**作品仓本身成为持久断点**。这样容器重启/重部署(CF Container ephemeral)丢掉本地盘后,重提同 projectSlug
+ * 仍能从断点续跑(见 restoreDurableCheckpoint),而不是从零重来。全程 best-effort、失败不致命(不打断构建)。
+ */
+async function checkpointToRepo(job: LoadedJob): Promise<void> {
+  if (!job.remoteUrl) return; // 本地仓无需(也无处)持久化
+  try {
+    const integ = job.manifest.integrationBranch;
+    const wt = await ensureIntegrationWorktree(job.repoPath, job.manifest.baseBranch, integ);
+    const dotLoop = path.join(wt, ".loop");
+    await fs.mkdir(dotLoop, { recursive: true });
+    await fs.writeFile(path.join(dotLoop, "loop.json"), JSON.stringify(job.manifest, null, 2) + "\n", "utf8");
+    await commitAll(wt, "chore(loop): CC-79 断点 checkpoint（task 状态）"); // 只提交 .loop/(task 代码已由 mergeToIntegration 提交)
+    const r = await pushRefs(job.repoPath, job.remoteUrl, [`${integ}:refs/heads/${integ}`], loopPushToken());
+    if (!r.pushed) log.warn(`CC-79 checkpoint 推送失败(不致命):${r.detail}`);
+  } catch (e) {
+    log.warn(`CC-79 checkpoint 失败(不致命):${(e as Error).message}`);
+  }
+}
+
+/**
+ * CC-79 断点续跑 · 读侧:job 开跑前,若远端作品仓已有上次 checkpoint 的集成分支(含 `.loop/loop.json`),
+ * 把其中「已 done 的 task」恢复到本轮 manifest —— 于是 hasPending/nextTask 会**跳过已完成、只续跑未完成**的。
+ * 未完成(failed/blocked/in_progress/todo)一律保持/回到 todo,自然重试(与 CC-73 重提语义一致)。
+ * ensureIntegrationWorktree 也会因本函数已 fetch 到 `origin/<integ>` 而**自它播种**集成分支(拿回已完成代码)。
+ * 全程 best-effort:远端无断点(全新构建)或解析失败 → 静默从头构建,不致命。
+ */
+async function restoreDurableCheckpoint(job: LoadedJob): Promise<void> {
+  if (!job.remoteUrl) return;
+  try {
+    const integ = job.manifest.integrationBranch;
+    const fetched = await fetchRemoteBranch(job.repoPath, job.remoteUrl, integ, loopPushToken());
+    if (!fetched) return; // 远端无此集成分支 = 全新构建
+    const raw = await showFileAtRef(job.repoPath, `origin/${integ}`, ".loop/loop.json");
+    if (!raw) return; // 有集成分支但无持久状态(老 job / 非本机制产生)
+    const prev = JSON.parse(raw) as { tasks?: Array<{ id: string; status: string; branch?: string; lastResult?: string }> };
+    const prevDone = new Map((prev.tasks ?? []).filter((t) => t.status === "done").map((t) => [t.id, t] as const));
+    let restored = 0;
+    for (const t of job.manifest.tasks) {
+      const p = prevDone.get(t.id);
+      if (p) {
+        t.status = "done";
+        if (p.branch) t.branch = p.branch;
+        if (p.lastResult) t.lastResult = p.lastResult;
+        restored++;
+      }
+    }
+    if (restored > 0) {
+      await saveJob(job);
+      log.ok(`CC-79 断点续跑:从作品仓恢复 ${restored} 个已完成 task,只续跑剩余`);
+    }
+  } catch (e) {
+    log.warn(`CC-79 断点恢复失败(不致命,将从头构建):${(e as Error).message}`);
+  }
+}
+
 /** 跑一个 job 的全部待办任务到收工，实时更新 registry 状态。 */
 async function processJob(jobId: string, signal?: AbortSignal): Promise<void> {
   const rec = registry.get(jobId);
@@ -299,6 +367,9 @@ async function processJob(jobId: string, signal?: AbortSignal): Promise<void> {
     setState(rec, "failed", { error: `目标 repo 不是 git 仓库：${job.repoPath}` });
     return;
   }
+
+  // CC-79 断点续跑:开跑前从作品仓恢复上次 checkpoint 的已完成 task(容器重启丢本地盘也能续)。
+  await restoreDurableCheckpoint(job);
 
   setState(rec, "coding");
   while (hasPending(job)) {
@@ -340,6 +411,9 @@ async function processJob(jobId: string, signal?: AbortSignal): Promise<void> {
       pushPhase(rec, task.id, result.usage); // Fix B：本任务节点成本(coder + 评审 + 返工)
       if (result.prUrl) rec.prUrl = result.prUrl;
     }
+    // CC-79 断点续跑:每个 task 收工(成功/失败)后都把「集成代码 + task 状态」推到作品仓做持久断点。
+    // 这样即便下一 task 挂或容器重启,已完成的部分也durable、重提可从此续跑(不从零重来)。
+    await checkpointToRepo(job);
   }
 
   const tasks = job.manifest.tasks;
