@@ -27,12 +27,16 @@ const body = JSON.parse(
 );
 assert.equal(body.event, "failed");
 assert.ok(typeof body.error === "string" && body.error.length <= 500, "回调 error 必须 ≤500 字");
+// CC-76 缺陷2：reason 与 error 同源回填（只读 reason 的调用方也能拿到人话原因），同样 ≤500 字
+assert.equal(body.reason, body.error, "回调 reason 必须与 error 同源");
+assert.ok(typeof body.reason === "string" && body.reason.length <= 500, "回调 reason 必须 ≤500 字");
 
-// 5. 无 error 的事件不带该字段
+// 5. 无 error 的事件不带该字段（error 与 reason 都不带）
 const ok = JSON.parse(
   callbackBody({ event: "coding_done", clientSlug: "c", projectSlug: "p", repo: "r" }),
 );
 assert.ok(!("error" in ok), "非失败事件不应带 error");
+assert.ok(!("reason" in ok), "非失败事件不应带 reason");
 
 // 6. Fix B:phases 分节明细进回调 body(失败/成功都带),空/无则不带
 const withPhases = JSON.parse(
