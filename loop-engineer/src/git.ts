@@ -243,6 +243,116 @@ async function branchExists(repo: string, branch: string): Promise<boolean> {
 }
 
 /**
+ * CC-79 断点续跑:best-effort 把远端某分支强更到本地 `origin/<branch>`(供续跑时从它播种 integration +
+ * 读回持久状态)。远端无此分支(全新构建)→ 静默返回 false,不影响正常流程。token 走 GIT_ASKPASS。
+ */
+export async function fetchRemoteBranch(
+  repo: string,
+  remoteUrl: string,
+  branch: string,
+  token?: string,
+): Promise<boolean> {
+  const auth = await buildAuth(remoteUrl, token);
+  try {
+    const r = await tryGit(
+      repo,
+      ["fetch", auth.url, `+refs/heads/${branch}:refs/remotes/origin/${branch}`],
+      auth.env,
+    );
+    return r !== null;
+  } finally {
+    await auth.cleanup();
+  }
+}
+
+/**
+ * CC-79:把一段内容作为单文件写进一个**专用 git ref**并推到远程 —— 纯 plumbing(临时 index + hash-object +
+ * commit-tree),**全程不碰任何 worktree、不进作品树/集成分支**。用于持久化断点状态(task 状态 JSON):
+ * 既不污染部署产物、也不会把冲突/脏改动误提交进 integration(codex 审 #1/#4/#5)。best-effort。
+ * 返回是否推送成功。
+ */
+export async function writeStateRef(
+  repo: string,
+  remoteUrl: string,
+  ref: string,
+  fileName: string,
+  content: string,
+  token?: string,
+): Promise<boolean> {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "loop-state-"));
+  const idx = path.join(dir, "index");
+  const blobFile = path.join(dir, "blob");
+  try {
+    await fs.writeFile(blobFile, content, "utf8");
+    const blob = await git(repo, ["hash-object", "-w", blobFile]); // 写 blob 进对象库,返回 sha
+    const idxEnv = { GIT_INDEX_FILE: idx };
+    await git(repo, ["read-tree", "--empty"], idxEnv); // 空临时 index(不动仓库主 index)
+    await git(repo, ["update-index", "--add", "--cacheinfo", `100644,${blob},${fileName}`], idxEnv);
+    const tree = await git(repo, ["write-tree"], idxEnv);
+    const commit = await git(repo, ["commit-tree", tree, "-m", "loop checkpoint (CC-79)"]); // 无 parent,单提交覆盖
+    await git(repo, ["update-ref", ref, commit]);
+    // 每次都是 orphan commit(无 parent)→ 覆盖旧 ref 是**非 fast-forward**,必须 `+` 强推(状态 ref 只留最新一份;
+    // 它不是分支,不受分支保护,force 安全)。否则第二次起 checkpoint 会因非 FF 被拒。
+    const pushed = await pushRefs(repo, remoteUrl, [`+${ref}:${ref}`], token);
+    return pushed.pushed;
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+/** CC-79:从远端取回 writeStateRef 写的专用 ref,读出其中单文件内容。ref/文件不存在返回 null。best-effort。 */
+export async function readStateRef(
+  repo: string,
+  remoteUrl: string,
+  ref: string,
+  fileName: string,
+  token?: string,
+): Promise<string | null> {
+  const auth = await buildAuth(remoteUrl, token);
+  try {
+    const fetched = await tryGit(repo, ["fetch", auth.url, `+${ref}:${ref}`], auth.env);
+    if (fetched === null) return null; // 远端无此 ref = 无断点
+  } finally {
+    await auth.cleanup();
+  }
+  // ⚠️ 自定义命名空间 ref(refs/loop-checkpoint/*)下,`git show <ref>:<path>` 会歧义解析成 commit 而非 blob;
+  // 必须 `^{commit}` 显式 peel 到 commit 再取树内文件,才拿到 state.json 的 blob 内容。
+  return tryGit(repo, ["show", `${ref}^{commit}:${fileName}`]);
+}
+
+/**
+ * CC-79:续跑对齐 —— 把本地集成分支(及其已挂 worktree)硬对齐到 `origin/<integrationBranch>`。
+ * 修 codex 审 #2:复用旧 clone 时本地 integration 可能陈旧(缺已完成 task 代码)。前置:`origin/<integ>` 已 fetch。
+ *   ① integ 已挂 __integration__ worktree → 在该 worktree `reset --hard origin/<integ>`;
+ *   ② 有本地 integ 分支但未挂 → `branch -f`;
+ *   ③ 无本地 integ 分支 → `branch` 新建。
+ * 远端无 origin/<integ> → no-op。best-effort。
+ */
+export async function seedIntegrationFromRemote(repo: string, integrationBranch: string): Promise<void> {
+  const remoteRef = `origin/${integrationBranch}`;
+  if (!(await branchExists(repo, remoteRef))) return;
+  const wtPath = path.join(wtRoot(repo), "__integration__");
+  const list = (await tryGit(repo, ["worktree", "list", "--porcelain"])) ?? "";
+  if (list.includes(wtPath)) {
+    await tryGit(wtPath, ["reset", "--hard", remoteRef]);
+  } else if (await branchExists(repo, integrationBranch)) {
+    await tryGit(repo, ["branch", "-f", integrationBranch, remoteRef]);
+  } else {
+    await tryGit(repo, ["branch", integrationBranch, remoteRef]);
+  }
+}
+
+/**
+ * CC-79:把集成 worktree 清回干净基线 —— 中止可能残留的 mid-merge/冲突,丢弃未提交/未跟踪改动。
+ * task 失败后调用,避免脏树拖垮下一个 task 的 `git merge`(codex 审 #1)。全 best-effort(tryGit 吞错)。
+ */
+export async function abortMergeAndClean(wtPath: string): Promise<void> {
+  await tryGit(wtPath, ["merge", "--abort"]); // 无 merge 进行中则报错→被吞,无害
+  await tryGit(wtPath, ["reset", "--hard", "HEAD"]);
+  await tryGit(wtPath, ["clean", "-fd"]);
+}
+
+/**
  * 防御式解析「基线起点」ref(容错/幂等):本地 baseBranch 缺失或未出生(空仓首 clone / 已存在仓只 fetch 未更新
  * 本地分支)时,依次退到 origin/base、FETCH_HEAD、HEAD。全都没有 = 仓库无任何提交 → 抛**友好错误**(会成为
  * 回传给前端的失败 reason)。修 CC-69 E2E:`git branch loop/integration main` 在陈旧/空仓上找不到 main 而挂。
@@ -274,6 +384,8 @@ export async function ensureIntegrationWorktree(
   const wtPath = path.join(wtRoot(repo), "__integration__");
 
   if (!(await branchExists(repo, integrationBranch))) {
+    // CC-79 续跑的「从远端集成分支播种」不在这里做(避免陈旧本地分支问题) —— 由 seedIntegrationFromRemote
+    // 在开跑前显式对齐。此处保持原行为:本地无集成分支时自 base 新建(全新构建)。
     const base = await resolveBaseRef(repo, baseBranch); // 容错:优先 origin/base(fetch 强更的最新),本地兜底
     await git(repo, ["branch", integrationBranch, base]);
     log.ok(`建集成分支 ${integrationBranch}（自 ${base}）`);
