@@ -29,6 +29,9 @@ const PASSTHROUGH_KEYS = [
 
 export interface Env {
   FDE_COPILOT: DurableObjectNamespace<FdeCopilotContainer>;
+  // CC-77 · 持久元数据存储（client/project-state/conversation）。容器盘 ephemeral，
+  // 数据模型落 D1；容器经 /_store/* HTTP shim 读写（见下方 handleStore）。
+  FDE_STORE: D1Database;
   [key: string]: unknown;
 }
 
@@ -40,6 +43,11 @@ function buildEnvVars(env: Env): Record<string, string> {
     LOOP_ENGINEER_URL:
       (typeof env.LOOP_ENGINEER_URL === "string" && env.LOOP_ENGINEER_URL) ||
       "https://loop.aastar.io",
+    // CC-77：容器侧 clients.ts 用此 URL 走 /_store shim 落 D1（跨重启存活）。
+    // 默认指向本 Worker 的自定义域；共享密钥复用 WORKBENCH_TOKEN。
+    WORKBENCH_STORE_URL:
+      (typeof env.WORKBENCH_STORE_URL === "string" && env.WORKBENCH_STORE_URL) ||
+      "https://workbench.aastar.io",
   };
   for (const k of PASSTHROUGH_KEYS) {
     const v = env[k];
@@ -60,8 +68,115 @@ export class FdeCopilotContainer extends Container<Env> {
   }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// CC-77 · 持久元数据 KV shim（D1 后端）
+//
+// 容器盘 ephemeral，client/usage 数据模型落 Worker 侧 D1；容器（clients.ts 的
+// HttpMetaStore）POST 到 /_store/*，带 x-store-secret = WORKBENCH_TOKEN。
+// 必须在 getContainer 代理之前拦截，否则会被转发进容器造成回环。
+// ─────────────────────────────────────────────────────────────────────────────
+function safeEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return diff === 0;
+}
+
+function json(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { "content-type": "application/json" },
+  });
+}
+
+async function ensureTable(db: D1Database): Promise<void> {
+  await db
+    .prepare("CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT NOT NULL, updated_at TEXT NOT NULL)")
+    .run();
+}
+
+/** 转义 LIKE 的通配符，使 prefix 仅做字面前缀匹配。 */
+function likePrefix(prefix: string): string {
+  return prefix.replace(/[\\%_]/g, (ch) => `\\${ch}`) + "%";
+}
+
+async function handleStore(request: Request, env: Env, url: URL): Promise<Response> {
+  if (request.method !== "POST") return json({ error: "method not allowed" }, 405);
+
+  const token = (env.WORKBENCH_TOKEN as string | undefined)?.trim();
+  // token 未配 = 单机自用（与 fde 鉴权语义一致）；配了则强制校验。
+  if (token) {
+    const got = request.headers.get("x-store-secret") || "";
+    if (!safeEqual(got, token)) return json({ error: "unauthorized" }, 401);
+  }
+
+  const db = env.FDE_STORE;
+  if (!db) return json({ error: "FDE_STORE 未绑定" }, 500);
+
+  let body: Record<string, unknown>;
+  try {
+    body = (await request.json()) as Record<string, unknown>;
+  } catch {
+    return json({ error: "bad json" }, 400);
+  }
+
+  const op = url.pathname.slice("/_store/".length);
+  const key = typeof body.k === "string" ? body.k : "";
+  await ensureTable(db);
+
+  switch (op) {
+    case "get": {
+      const row = await db.prepare("SELECT v FROM kv WHERE k = ?1").bind(key).first<{ v: string }>();
+      return json({ v: row?.v ?? null });
+    }
+    case "put": {
+      const v = typeof body.v === "string" ? body.v : "";
+      await db
+        .prepare(
+          "INSERT INTO kv (k,v,updated_at) VALUES (?1,?2,?3) ON CONFLICT(k) DO UPDATE SET v=excluded.v, updated_at=excluded.updated_at",
+        )
+        .bind(key, v, new Date().toISOString())
+        .run();
+      return json({ ok: true });
+    }
+    case "append": {
+      const v = typeof body.v === "string" ? body.v : "";
+      await db
+        .prepare(
+          "INSERT INTO kv (k,v,updated_at) VALUES (?1,?2,?3) ON CONFLICT(k) DO UPDATE SET v = kv.v || excluded.v, updated_at=excluded.updated_at",
+        )
+        .bind(key, v, new Date().toISOString())
+        .run();
+      return json({ ok: true });
+    }
+    case "exists": {
+      const row = await db.prepare("SELECT 1 AS x FROM kv WHERE k = ?1 LIMIT 1").bind(key).first();
+      return json({ exists: !!row });
+    }
+    case "list": {
+      const prefix = typeof body.prefix === "string" ? body.prefix : "";
+      const res = await db
+        .prepare("SELECT k FROM kv WHERE k LIKE ?1 ESCAPE '\\'")
+        .bind(likePrefix(prefix))
+        .all<{ k: string }>();
+      const seen = new Set<string>();
+      for (const r of res.results ?? []) {
+        const rest = r.k.slice(prefix.length);
+        const seg = rest.split("/")[0];
+        if (seg) seen.add(seg);
+      }
+      return json({ children: [...seen] });
+    }
+    default:
+      return json({ error: `unknown op: ${op}` }, 404);
+  }
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
+    const url = new URL(request.url);
+    // CC-77：持久存储 shim 必须先于容器代理拦截。
+    if (url.pathname.startsWith("/_store/")) return handleStore(request, env, url);
     // 单例：同会话命中同一容器（spec 文件 + git push 交付）。Container.fetch 自动冷启并代理。
     return getContainer(env.FDE_COPILOT, "singleton").fetch(request);
   },

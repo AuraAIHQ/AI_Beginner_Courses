@@ -44,44 +44,142 @@ async function exists(p: string): Promise<boolean> {
   return fs.access(p).then(() => true).catch(() => false);
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// CC-77 · 持久元数据存储（client.json / state.json / conversation.jsonl）
+//
+// 病根：fde-copilot 跑在单例 CF Container，clients/ 只写容器本地盘 + gitignored，
+// 容器 sleepAfter:1h ephemeral → 冷启/重部署即丢盘 → client + usage 全没 →
+// GET /api/usage?client= 返回 404「客户不存在」→ hack5 结算拉不到 → 预扣永久卡 reserved。
+//
+// 修法：把「数据模型」（客户 / 项目状态[含 usage] / 会话）落到 Worker 侧 D1（durable），
+// 容器经 HTTP shim（/_store/*，见 deploy/fde-copilot/src/index.ts）读写。
+// 未配 WORKBENCH_STORE_URL 时回落本地文件（本地开发行为与旧版完全一致）。
+//
+// 注意边界：SPEC_DOCS（SPEC.md 等生成文档）**不**入库 —— 它们由 agent-sdk 直接写在
+// projectDir 工作目录、并由 git.ts push 交付，是「每会话工作集」，非持久数据模型。
+// 故文档读写仍走文件系统（下方 readDoc/readAllDocs + createProject 的 scaffold 写盘）。
+// ─────────────────────────────────────────────────────────────────────────────
+interface MetaStore {
+  read(key: string): Promise<string | null>;
+  write(key: string, value: string): Promise<void>;
+  append(key: string, line: string): Promise<void>;
+  exists(key: string): Promise<boolean>;
+  /** prefix 下的直接子段名（模拟 readdir）。prefix="" → 客户 slug；"<c>/projects/" → 项目 slug。 */
+  children(prefix: string): Promise<string[]>;
+}
+
+/** 本地开发回落：读写与旧版同一份 clients/ 磁盘布局，行为不变。 */
+class FsMetaStore implements MetaStore {
+  private full(key: string): string {
+    const p = path.resolve(CLIENTS_DIR, key);
+    if (p !== CLIENTS_DIR && !p.startsWith(CLIENTS_DIR + path.sep)) {
+      throw new Error(`存储键越界：${key}`);
+    }
+    return p;
+  }
+  async read(key: string): Promise<string | null> {
+    try { return await fs.readFile(this.full(key), "utf8"); } catch { return null; }
+  }
+  async write(key: string, value: string): Promise<void> {
+    const p = this.full(key);
+    await fs.mkdir(path.dirname(p), { recursive: true });
+    await fs.writeFile(p, value, "utf8");
+  }
+  async append(key: string, line: string): Promise<void> {
+    const p = this.full(key);
+    await fs.mkdir(path.dirname(p), { recursive: true });
+    await fs.appendFile(p, line, "utf8");
+  }
+  async exists(key: string): Promise<boolean> {
+    return exists(this.full(key));
+  }
+  async children(prefix: string): Promise<string[]> {
+    const base = prefix ? this.full(prefix) : CLIENTS_DIR;
+    try {
+      const entries = await fs.readdir(base, { withFileTypes: true });
+      return entries.filter((e) => e.isDirectory()).map((e) => e.name);
+    } catch {
+      return [];
+    }
+  }
+}
+
+/** 生产：经 Worker /_store shim 落 D1（跨容器重启存活）。共享密钥 = WORKBENCH_TOKEN。 */
+class HttpMetaStore implements MetaStore {
+  constructor(private base: string, private secret: string) {}
+  private async call(op: string, body: Record<string, unknown>): Promise<Record<string, unknown>> {
+    const res = await fetch(`${this.base.replace(/\/+$/, "")}/_store/${op}`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-store-secret": this.secret },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) throw new Error(`store ${op} → HTTP ${res.status}`);
+    return (await res.json()) as Record<string, unknown>;
+  }
+  async read(key: string): Promise<string | null> {
+    const r = await this.call("get", { k: key });
+    return typeof r.v === "string" ? r.v : null;
+  }
+  async write(key: string, value: string): Promise<void> {
+    await this.call("put", { k: key, v: value });
+  }
+  async append(key: string, line: string): Promise<void> {
+    await this.call("append", { k: key, v: line });
+  }
+  async exists(key: string): Promise<boolean> {
+    const r = await this.call("exists", { k: key });
+    return r.exists === true;
+  }
+  async children(prefix: string): Promise<string[]> {
+    const r = await this.call("list", { prefix });
+    return Array.isArray(r.children) ? (r.children as string[]) : [];
+  }
+}
+
+const meta: MetaStore = (() => {
+  const url = process.env.WORKBENCH_STORE_URL?.trim();
+  if (url) {
+    const secret = process.env.WORKBENCH_TOKEN?.trim() || process.env.WORKBENCH_SCOPED_SECRET?.trim() || "";
+    return new HttpMetaStore(url, secret);
+  }
+  return new FsMetaStore();
+})();
+
+const clientKey = (clientSlug: string) => `${clientSlug}/client.json`;
+const stateKey = (clientSlug: string, projectSlug: string) => `${clientSlug}/projects/${projectSlug}/state.json`;
+const convKey = (clientSlug: string, projectSlug: string) => `${clientSlug}/projects/${projectSlug}/conversation.jsonl`;
+
 // —— 客户 ——
 export async function listClients(): Promise<Client[]> {
-  if (!(await exists(CLIENTS_DIR))) return [];
-  const entries = await fs.readdir(CLIENTS_DIR, { withFileTypes: true });
   const out: Client[] = [];
-  for (const e of entries) {
-    if (!e.isDirectory()) continue;
-    const c = await readClient(e.name);
+  for (const slug of await meta.children("")) {
+    const c = await readClient(slug);
     if (c) out.push(c);
   }
   return out.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
 }
 
 export async function readClient(clientSlug: string): Promise<Client | null> {
-  let dir: string;
-  try { dir = clientDir(clientSlug); } catch { return null; }
-  try {
-    return JSON.parse(await fs.readFile(path.join(dir, "client.json"), "utf8")) as Client;
-  } catch {
-    return null;
-  }
+  try { assertSafe(clientSlug); } catch { return null; }
+  const raw = await meta.read(clientKey(clientSlug));
+  if (raw == null) return null;
+  try { return JSON.parse(raw) as Client; } catch { return null; }
 }
 
 export async function writeClient(c: Client): Promise<void> {
-  const dir = clientDir(c.slug);
-  await fs.mkdir(dir, { recursive: true });
-  await fs.writeFile(path.join(dir, "client.json"), JSON.stringify(c, null, 2), "utf8");
+  assertSafe(c.slug);
+  await meta.write(clientKey(c.slug), JSON.stringify(c, null, 2));
 }
 
 export async function createClient(name: string, background: string): Promise<Client> {
   const slug = slugify(name);
-  if (await exists(path.join(clientDir(slug), "client.json"))) {
+  assertSafe(slug);
+  if (await meta.exists(clientKey(slug))) {
     throw new Error(`客户「${slug}」已存在`);
   }
   const now = new Date().toISOString();
   const c: Client = { slug, name, background: background.trim(), createdAt: now, updatedAt: now };
   await writeClient(c);
-  await fs.mkdir(path.join(clientDir(slug), "projects"), { recursive: true });
   return c;
 }
 
@@ -101,44 +199,41 @@ function docScaffold(clientName: string, projectName: string, deliverable: Deliv
 }
 
 export async function listProjects(clientSlug: string): Promise<ProjectState[]> {
-  const base = path.join(clientDir(clientSlug), "projects");
-  if (!(await exists(base))) return [];
-  const entries = await fs.readdir(base, { withFileTypes: true });
+  try { assertSafe(clientSlug); } catch { return []; }
   const out: ProjectState[] = [];
-  for (const e of entries) {
-    if (!e.isDirectory()) continue;
-    const s = await readProjectState(clientSlug, e.name);
+  for (const slug of await meta.children(`${clientSlug}/projects/`)) {
+    const s = await readProjectState(clientSlug, slug);
     if (s) out.push(s);
   }
   return out.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
 }
 
 export async function readProjectState(clientSlug: string, projectSlug: string): Promise<ProjectState | null> {
-  let dir: string;
-  try { dir = projectDir(clientSlug, projectSlug); } catch { return null; }
-  try {
-    return JSON.parse(await fs.readFile(path.join(dir, "state.json"), "utf8")) as ProjectState;
-  } catch {
-    return null;
-  }
+  try { assertSafe(clientSlug); assertSafe(projectSlug); } catch { return null; }
+  const raw = await meta.read(stateKey(clientSlug, projectSlug));
+  if (raw == null) return null;
+  try { return JSON.parse(raw) as ProjectState; } catch { return null; }
 }
 
 export async function writeProjectState(s: ProjectState): Promise<void> {
-  const dir = projectDir(s.clientSlug, s.slug);
-  await fs.writeFile(path.join(dir, "state.json"), JSON.stringify(s, null, 2), "utf8");
+  assertSafe(s.clientSlug); assertSafe(s.slug);
+  await meta.write(stateKey(s.clientSlug, s.slug), JSON.stringify(s, null, 2));
 }
 
 export async function createProject(clientSlug: string, name: string, deliverable: Deliverable): Promise<ProjectState> {
   const client = await readClient(clientSlug);
   if (!client) throw new Error("客户不存在");
   const slug = slugify(name);
-  const dir = projectDir(clientSlug, slug);
-  if (await exists(dir)) throw new Error(`项目「${slug}」已存在`);
-  await fs.mkdir(dir, { recursive: true });
+  assertSafe(slug);
+  if (await meta.exists(stateKey(clientSlug, slug))) throw new Error(`项目「${slug}」已存在`);
   const now = new Date().toISOString();
+  // 文档是「每会话工作集」：由 agent-sdk 直接读写 projectDir、git push 交付 → 仍落文件系统。
+  const dir = projectDir(clientSlug, slug);
+  await fs.mkdir(dir, { recursive: true });
   const scaffold = docScaffold(client.name, name, deliverable, now.slice(0, 10));
   await Promise.all(Object.entries(scaffold).map(([f, c]) => fs.writeFile(path.join(dir, f), c, "utf8")));
-  await fs.writeFile(path.join(dir, "conversation.jsonl"), "", "utf8");
+  // 会话 + 项目状态（含 usage）是持久数据模型 → 落 meta store（生产 = D1）。
+  await meta.write(convKey(clientSlug, slug), "");
   const state: ProjectState = {
     slug, clientSlug, name, deliverable,
     createdAt: now, updatedAt: now, rounds: 0, status: "intake", lastReadiness: null,
@@ -147,7 +242,7 @@ export async function createProject(clientSlug: string, name: string, deliverabl
   return state;
 }
 
-// —— 文档 / 会话（挂在项目下）——
+// —— 文档（挂在项目下，工作集，走文件系统）——
 export async function readDoc(clientSlug: string, projectSlug: string, file: string): Promise<string | null> {
   if (!SPEC_DOCS.includes(file as never)) return null;
   let dir: string;
@@ -166,14 +261,15 @@ export async function readAllDocs(clientSlug: string, projectSlug: string): Prom
   return out;
 }
 
+// —— 会话（持久数据模型，走 meta store）——
 export async function appendConversation(clientSlug: string, projectSlug: string, entry: ConversationEntry): Promise<void> {
-  const p = path.join(projectDir(clientSlug, projectSlug), "conversation.jsonl");
-  await fs.appendFile(p, JSON.stringify(entry) + "\n", "utf8");
+  assertSafe(clientSlug); assertSafe(projectSlug);
+  await meta.append(convKey(clientSlug, projectSlug), JSON.stringify(entry) + "\n");
 }
 
 export async function readConversation(clientSlug: string, projectSlug: string): Promise<ConversationEntry[]> {
-  const p = path.join(projectDir(clientSlug, projectSlug), "conversation.jsonl");
-  if (!(await exists(p))) return [];
-  const raw = await fs.readFile(p, "utf8");
+  try { assertSafe(clientSlug); assertSafe(projectSlug); } catch { return []; }
+  const raw = await meta.read(convKey(clientSlug, projectSlug));
+  if (!raw) return [];
   return raw.split("\n").filter(Boolean).map((l) => JSON.parse(l) as ConversationEntry);
 }
