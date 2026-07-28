@@ -51,18 +51,19 @@ async function exists(p: string): Promise<boolean> {
 // 容器 sleepAfter:1h ephemeral → 冷启/重部署即丢盘 → client + usage 全没 →
 // GET /api/usage?client= 返回 404「客户不存在」→ hack5 结算拉不到 → 预扣永久卡 reserved。
 //
-// 修法：把「数据模型」（客户 / 项目状态[含 usage] / 会话）落到 Worker 侧 D1（durable），
-// 容器经 HTTP shim（/_store/*，见 deploy/fde-copilot/src/index.ts）读写。
+// 修法：把「持久数据模型」（客户 client.json / 项目状态 state.json[含 usage]）落到
+// Worker 侧 D1（durable），容器经 HTTP shim（/_store/*，见 deploy/fde-copilot/src/index.ts）读写。
 // 未配 WORKBENCH_STORE_URL 时回落本地文件（本地开发行为与旧版完全一致）。
 //
-// 注意边界：SPEC_DOCS（SPEC.md 等生成文档）**不**入库 —— 它们由 agent-sdk 直接写在
-// projectDir 工作目录、并由 git.ts push 交付，是「每会话工作集」，非持久数据模型。
-// 故文档读写仍走文件系统（下方 readDoc/readAllDocs + createProject 的 scaffold 写盘）。
+// 注意边界：SPEC_DOCS（SPEC.md 等生成文档）+ conversation.jsonl（会话）**不**入库 ——
+// 它们由 agent-sdk 直接写在 projectDir 工作目录、并由 git.ts push 交付，是「每会话工作集」，
+// 非持久数据模型；且把无界增长的会话拼进 D1 单个 TEXT 值会撞上限。故二者仍走文件系统
+// （readDoc/readAllDocs/appendConversation/readConversation + createProject 的 scaffold 写盘）。
+// usage/结算所需的 state.json.usage 已落 D1 → 已足以根治 /api/usage 404 卡结算。
 // ─────────────────────────────────────────────────────────────────────────────
 interface MetaStore {
   read(key: string): Promise<string | null>;
   write(key: string, value: string): Promise<void>;
-  append(key: string, line: string): Promise<void>;
   exists(key: string): Promise<boolean>;
   /** prefix 下的直接子段名（模拟 readdir）。prefix="" → 客户 slug；"<c>/projects/" → 项目 slug。 */
   children(prefix: string): Promise<string[]>;
@@ -84,11 +85,6 @@ class FsMetaStore implements MetaStore {
     const p = this.full(key);
     await fs.mkdir(path.dirname(p), { recursive: true });
     await fs.writeFile(p, value, "utf8");
-  }
-  async append(key: string, line: string): Promise<void> {
-    const p = this.full(key);
-    await fs.mkdir(path.dirname(p), { recursive: true });
-    await fs.appendFile(p, line, "utf8");
   }
   async exists(key: string): Promise<boolean> {
     return exists(this.full(key));
@@ -123,9 +119,6 @@ class HttpMetaStore implements MetaStore {
   async write(key: string, value: string): Promise<void> {
     await this.call("put", { k: key, v: value });
   }
-  async append(key: string, line: string): Promise<void> {
-    await this.call("append", { k: key, v: line });
-  }
   async exists(key: string): Promise<boolean> {
     const r = await this.call("exists", { k: key });
     return r.exists === true;
@@ -136,18 +129,20 @@ class HttpMetaStore implements MetaStore {
   }
 }
 
+// 存储密钥（两端必须一致）：优先 WORKBENCH_STORE_SECRET，回落 WORKBENCH_TOKEN。
+// 不再回落 WORKBENCH_SCOPED_SECRET —— 那是 hack5 参赛者 token 的 HMAC 签名密钥，用途不同，
+// 若两端来源不对称会导致「一端配了、Worker 侧没配 → 静默公开存储」。Worker handleStore 用同一条链。
+function storeSecret(): string {
+  return process.env.WORKBENCH_STORE_SECRET?.trim() || process.env.WORKBENCH_TOKEN?.trim() || "";
+}
+
 const meta: MetaStore = (() => {
   const url = process.env.WORKBENCH_STORE_URL?.trim();
-  if (url) {
-    const secret = process.env.WORKBENCH_TOKEN?.trim() || process.env.WORKBENCH_SCOPED_SECRET?.trim() || "";
-    return new HttpMetaStore(url, secret);
-  }
-  return new FsMetaStore();
+  return url ? new HttpMetaStore(url, storeSecret()) : new FsMetaStore();
 })();
 
 const clientKey = (clientSlug: string) => `${clientSlug}/client.json`;
 const stateKey = (clientSlug: string, projectSlug: string) => `${clientSlug}/projects/${projectSlug}/state.json`;
-const convKey = (clientSlug: string, projectSlug: string) => `${clientSlug}/projects/${projectSlug}/conversation.jsonl`;
 
 // —— 客户 ——
 export async function listClients(): Promise<Client[]> {
@@ -232,8 +227,8 @@ export async function createProject(clientSlug: string, name: string, deliverabl
   await fs.mkdir(dir, { recursive: true });
   const scaffold = docScaffold(client.name, name, deliverable, now.slice(0, 10));
   await Promise.all(Object.entries(scaffold).map(([f, c]) => fs.writeFile(path.join(dir, f), c, "utf8")));
-  // 会话 + 项目状态（含 usage）是持久数据模型 → 落 meta store（生产 = D1）。
-  await meta.write(convKey(clientSlug, slug), "");
+  await fs.writeFile(path.join(dir, "conversation.jsonl"), "", "utf8");
+  // 项目状态（含 usage）是持久数据模型 → 落 meta store（生产 = D1）。
   const state: ProjectState = {
     slug, clientSlug, name, deliverable,
     createdAt: now, updatedAt: now, rounds: 0, status: "intake", lastReadiness: null,
@@ -261,15 +256,20 @@ export async function readAllDocs(clientSlug: string, projectSlug: string): Prom
   return out;
 }
 
-// —— 会话（持久数据模型，走 meta store）——
+// —— 会话（每会话工作集，走文件系统）——
+// 与 SPEC_DOCS 一致:conversation.jsonl 是「工作集」而非持久数据模型,故走 fs,不入 D1。
+// 这也避免把无界增长的会话拼进 D1 单个 TEXT 值撞上限(会让后续 append 恒抛)。
+// 持久数据模型 = client + project-state(含 usage),已落 meta store,足以修 /api/usage 404。
 export async function appendConversation(clientSlug: string, projectSlug: string, entry: ConversationEntry): Promise<void> {
-  assertSafe(clientSlug); assertSafe(projectSlug);
-  await meta.append(convKey(clientSlug, projectSlug), JSON.stringify(entry) + "\n");
+  const p = path.join(projectDir(clientSlug, projectSlug), "conversation.jsonl");
+  await fs.appendFile(p, JSON.stringify(entry) + "\n", "utf8");
 }
 
 export async function readConversation(clientSlug: string, projectSlug: string): Promise<ConversationEntry[]> {
-  try { assertSafe(clientSlug); assertSafe(projectSlug); } catch { return []; }
-  const raw = await meta.read(convKey(clientSlug, projectSlug));
-  if (!raw) return [];
+  let dir: string;
+  try { dir = projectDir(clientSlug, projectSlug); } catch { return []; }
+  const p = path.join(dir, "conversation.jsonl");
+  if (!(await exists(p))) return [];
+  const raw = await fs.readFile(p, "utf8");
   return raw.split("\n").filter(Boolean).map((l) => JSON.parse(l) as ConversationEntry);
 }

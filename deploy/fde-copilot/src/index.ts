@@ -9,6 +9,7 @@ const PASSTHROUGH_KEYS = [
   // 鉴权
   "WORKBENCH_TOKEN",
   "WORKBENCH_SCOPED_SECRET",
+  "WORKBENCH_STORE_SECRET", // CC-77：/_store 专用密钥（可选，未配则回落 WORKBENCH_TOKEN，两端一致）
   // 模型云 key（快 chat 直连 HiLinkup；full 路径回落 DeepSeek 云端点；均非 Anthropic 官方）
   "HILINKUP_API_KEY",
   "HILINKUP_BASE_URL",
@@ -89,10 +90,20 @@ function json(body: unknown, status = 200): Response {
   });
 }
 
+let tableReady = false;
 async function ensureTable(db: D1Database): Promise<void> {
+  if (tableReady) return; // 每 isolate 一次；CREATE IF NOT EXISTS 本身幂等，此 guard 省掉每请求一次往返。
   await db
     .prepare("CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT NOT NULL, updated_at TEXT NOT NULL)")
     .run();
+  tableReady = true;
+}
+
+/** /_store 存储密钥（与容器侧 clients.ts storeSecret() 同一条链）。 */
+function storeSecret(env: Env): string {
+  const s = (env.WORKBENCH_STORE_SECRET as string | undefined)?.trim();
+  const t = (env.WORKBENCH_TOKEN as string | undefined)?.trim();
+  return s || t || "";
 }
 
 /** 转义 LIKE 的通配符，使 prefix 仅做字面前缀匹配。 */
@@ -103,12 +114,12 @@ function likePrefix(prefix: string): string {
 async function handleStore(request: Request, env: Env, url: URL): Promise<Response> {
   if (request.method !== "POST") return json({ error: "method not allowed" }, 405);
 
-  const token = (env.WORKBENCH_TOKEN as string | undefined)?.trim();
-  // token 未配 = 单机自用（与 fde 鉴权语义一致）；配了则强制校验。
-  if (token) {
-    const got = request.headers.get("x-store-secret") || "";
-    if (!safeEqual(got, token)) return json({ error: "unauthorized" }, 401);
-  }
+  // Fail-closed:本路由绑在公网 custom domain，任何时候都可达。若未配存储密钥，一律 503，
+  // 绝不「未配=公开」——否则可被匿名读写计费 KV（读 PII / 篡改 usage / list 枚举全部 client）。
+  const secret = storeSecret(env);
+  if (!secret) return json({ error: "store 未配置密钥（WORKBENCH_STORE_SECRET / WORKBENCH_TOKEN）" }, 503);
+  const got = request.headers.get("x-store-secret") || "";
+  if (!safeEqual(got, secret)) return json({ error: "unauthorized" }, 401);
 
   const db = env.FDE_STORE;
   if (!db) return json({ error: "FDE_STORE 未绑定" }, 500);
@@ -134,16 +145,6 @@ async function handleStore(request: Request, env: Env, url: URL): Promise<Respon
       await db
         .prepare(
           "INSERT INTO kv (k,v,updated_at) VALUES (?1,?2,?3) ON CONFLICT(k) DO UPDATE SET v=excluded.v, updated_at=excluded.updated_at",
-        )
-        .bind(key, v, new Date().toISOString())
-        .run();
-      return json({ ok: true });
-    }
-    case "append": {
-      const v = typeof body.v === "string" ? body.v : "";
-      await db
-        .prepare(
-          "INSERT INTO kv (k,v,updated_at) VALUES (?1,?2,?3) ON CONFLICT(k) DO UPDATE SET v = kv.v || excluded.v, updated_at=excluded.updated_at",
         )
         .bind(key, v, new Date().toISOString())
         .run();
