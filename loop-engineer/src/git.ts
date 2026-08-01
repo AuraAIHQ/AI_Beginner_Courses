@@ -262,20 +262,41 @@ export async function ensureRemoteRepo(
     return { created: false, detail: `探测 repo 失败 HTTP ${exist.status}` };
   }
   // owner 是否为 token 属主(User) → /user/repos；否则按组织建
-  let underUser = false;
+  let login: string | null = null;
   const me = await gh("GET", `/user`);
   if (me.status === 200) {
     try {
-      underUser = (JSON.parse(me.text).login as string)?.toLowerCase() === owner.toLowerCase();
+      login = ((JSON.parse(me.text).login as string) ?? "").toLowerCase() || null;
     } catch {
-      /* 解析失败按组织路径兜底 */
+      /* 解析失败 → login 留 null，只走白名单判定 */
     }
+  }
+  const underUser = !!login && login === owner.toLowerCase();
+  // review #1(owner/org 白名单)：/plan 的 repo 只校验 URL 形状不限属主，若不设防，共享 push token
+  // 会在它有权限的**任意 org** 下按调用方指定名字建公开仓。故默认**仅允许 token 属主名下**自动建；
+  // 其它 org 必须经 LOOP_AUTOCREATE_OWNERS(逗号分隔)显式放行，否则跳过(交给 precheck 照常 404→422)。
+  const allowOwners = (process.env.LOOP_AUTOCREATE_OWNERS || "")
+    .split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
+  if (!underUser && !allowOwners.includes(owner.toLowerCase())) {
+    return {
+      created: false,
+      detail: `owner「${owner}」不在自动建仓白名单（默认仅 push token 属主；org 需 LOOP_AUTOCREATE_OWNERS 显式放行），跳过自动建仓`,
+    };
   }
   const createPath = underUser ? `/user/repos` : `/orgs/${owner}/repos`;
   const created = await gh("POST", createPath, { name, private: false, auto_init: true });
   if (created.status === 201) return { created: true, detail: `已自动建仓 ${owner}/${name}` };
-  // 并发/竞态下另一路已建 → GitHub 返回 422，视为已存在
-  if (created.status === 422) return { created: false, detail: `仓已存在（422）${owner}/${name}` };
+  // review #2：422 可能是「已存在(并发/竞态)」也可能是「名称非法/校验失败」，别一律当已存在(误导日志)。
+  // 两种情形都 created:false 不抛：已存在 → precheck 通过；名称非法 → precheck 404→422 正确兜住。
+  if (created.status === 422) {
+    const exists = /already exists/i.test(created.text);
+    return {
+      created: false,
+      detail: exists
+        ? `仓已存在 ${owner}/${name}`
+        : `建仓 422（名称非法或校验失败）：${created.text.slice(0, 200)}`,
+    };
+  }
   return { created: false, detail: `建仓失败 HTTP ${created.status}：${created.text.slice(0, 200)}` };
 }
 
