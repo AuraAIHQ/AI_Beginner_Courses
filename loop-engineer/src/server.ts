@@ -37,6 +37,7 @@ import {
   pruneWorktrees,
   isRemoteRepo,
   ensureClone,
+  ensureRemoteRepo,
   pushRefs,
   remoteReachable,
   ensureIntegrationWorktree,
@@ -767,8 +768,18 @@ async function handlePlan(req: IncomingMessage, res: ServerResponse): Promise<vo
     send(res, 400, { error: (e as Error).message });
     return;
   }
+  // fde-copilot 直连 /plan（workbench.aastar.io 控制台）没有建仓步骤（建仓原是 hack5
+  // participant-repo.ts 的活）→ 目标作品仓不存在。此处兜底：远程作品仓缺失就用 push token
+  // 自动建（hack5 流程仓已存在 → no-op）。可用 LOOP_AUTOCREATE_REPO=0 关闭。建完再走预检。
+  if (isRemoteRepo(repo) && process.env.LOOP_AUTOCREATE_REPO !== "0") {
+    try {
+      const ens = await ensureRemoteRepo(repo, loopPushToken());
+      if (ens.created) log.info(`/plan 自动建仓：${ens.detail}（${clientSlug}/${projectSlug}）`);
+    } catch (e) {
+      log.warn(`/plan 自动建仓失败（继续走预检）：${(e as Error).message}`);
+    }
+  }
   // CC-76 缺陷1：建仓预检 —— 目标 repo 不存在/不可达就同步 422，别进后台 job 才炸。
-  // 常见触发：hack5 尚未建仓就直连 loop /plan（建仓是 hack5 participant-repo.ts 的活）。
   const pre = await precheckRepo(repo, specDir);
   if (!pre.ok) {
     send(res, 422, {

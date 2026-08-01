@@ -210,6 +210,97 @@ export async function remoteReachable(
 }
 
 /**
+ * 确保远程作品仓存在：github.com 的 HTTPS 目标仓若不存在（404），用 push token 自动建仓
+ * （`auto_init:true` 带一个初始提交 → 建完即有 HEAD、可 clone）。
+ *
+ * 背景：建仓原是 hack5 participant-repo.ts 的活，hack5 流程会先建仓再调 /plan。fde-copilot
+ * 直连 /plan（workbench.aastar.io 控制台）没有这一步 → precheckRepo 必 404 → 卡在
+ * 「目标 repo 不存在，请先建仓」。此处兜底：仓已存在（hack5 流程/重复调用）→ no-op；
+ * 仓缺失 → 用 push token 属主名义建。owner 与 token 属主(login)一致 → POST /user/repos；
+ * 否则按组织 → POST /orgs/{owner}/repos。非 github.com / 非 https / 无 token → 跳过。
+ */
+export async function ensureRemoteRepo(
+  remoteUrl: string,
+  token?: string,
+): Promise<{ created: boolean; detail: string }> {
+  if (!token) return { created: false, detail: "无 push token，跳过自动建仓" };
+  let u: URL;
+  try {
+    u = new URL(remoteUrl);
+  } catch {
+    return { created: false, detail: "非 URL（本地路径），跳过" };
+  }
+  if (u.protocol !== "https:" || u.host.toLowerCase() !== "github.com") {
+    return { created: false, detail: "非 github.com https，跳过自动建仓" };
+  }
+  try {
+    assertAllowedPushHost(remoteUrl);
+  } catch (e) {
+    return { created: false, detail: (e as Error).message };
+  }
+  const parts = u.pathname.replace(/^\/+/, "").replace(/\.git$/, "").split("/");
+  const [owner, name] = parts;
+  if (!owner || !name || parts.length > 2) {
+    return { created: false, detail: `无法解析 owner/repo：${u.pathname}` };
+  }
+  const gh = async (method: string, apiPath: string, body?: unknown) => {
+    const res = await fetch(`https://api.github.com${apiPath}`, {
+      method,
+      headers: {
+        authorization: `Bearer ${token}`,
+        accept: "application/vnd.github+json",
+        "user-agent": "loop-engineer",
+        ...(body ? { "content-type": "application/json" } : {}),
+      },
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    return { status: res.status, text: redact(await res.text(), token) };
+  };
+  const exist = await gh("GET", `/repos/${owner}/${name}`);
+  if (exist.status === 200) return { created: false, detail: "仓已存在" };
+  if (exist.status !== 404) {
+    return { created: false, detail: `探测 repo 失败 HTTP ${exist.status}` };
+  }
+  // owner 是否为 token 属主(User) → /user/repos；否则按组织建
+  let login: string | null = null;
+  const me = await gh("GET", `/user`);
+  if (me.status === 200) {
+    try {
+      login = ((JSON.parse(me.text).login as string) ?? "").toLowerCase() || null;
+    } catch {
+      /* 解析失败 → login 留 null，只走白名单判定 */
+    }
+  }
+  const underUser = !!login && login === owner.toLowerCase();
+  // review #1(owner/org 白名单)：/plan 的 repo 只校验 URL 形状不限属主，若不设防，共享 push token
+  // 会在它有权限的**任意 org** 下按调用方指定名字建公开仓。故默认**仅允许 token 属主名下**自动建；
+  // 其它 org 必须经 LOOP_AUTOCREATE_OWNERS(逗号分隔)显式放行，否则跳过(交给 precheck 照常 404→422)。
+  const allowOwners = (process.env.LOOP_AUTOCREATE_OWNERS || "")
+    .split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
+  if (!underUser && !allowOwners.includes(owner.toLowerCase())) {
+    return {
+      created: false,
+      detail: `owner「${owner}」不在自动建仓白名单（默认仅 push token 属主；org 需 LOOP_AUTOCREATE_OWNERS 显式放行），跳过自动建仓`,
+    };
+  }
+  const createPath = underUser ? `/user/repos` : `/orgs/${owner}/repos`;
+  const created = await gh("POST", createPath, { name, private: false, auto_init: true });
+  if (created.status === 201) return { created: true, detail: `已自动建仓 ${owner}/${name}` };
+  // review #2：422 可能是「已存在(并发/竞态)」也可能是「名称非法/校验失败」，别一律当已存在(误导日志)。
+  // 两种情形都 created:false 不抛：已存在 → precheck 通过；名称非法 → precheck 404→422 正确兜住。
+  if (created.status === 422) {
+    const exists = /already exists/i.test(created.text);
+    return {
+      created: false,
+      detail: exists
+        ? `仓已存在 ${owner}/${name}`
+        : `建仓 422（名称非法或校验失败）：${created.text.slice(0, 200)}`,
+    };
+  }
+  return { created: false, detail: `建仓失败 HTTP ${created.status}：${created.text.slice(0, 200)}` };
+}
+
+/**
  * 把本地分支 push 回远程若干 refspec（token 走 GIT_ASKPASS，不进 argv/.git/config）。
  * 逐条独立 push：某条失败（如 main 非 fast-forward）不影响其它条落地。
  */
