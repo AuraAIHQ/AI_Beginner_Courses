@@ -10,6 +10,8 @@ const PASSTHROUGH_KEYS = [
   "WORKBENCH_TOKEN",
   "WORKBENCH_SCOPED_SECRET",
   "WORKBENCH_STORE_SECRET", // CC-77：/_store 专用密钥（可选，未配则回落 WORKBENCH_TOKEN，两端一致）
+  "WORKBENCH_UI_PASSWORD", // PR#85：第一方控制台登录口令（/api/login 校验后签发 session cookie）
+  "WORKBENCH_UI_SECRET", // 可选：session cookie 签名密钥（未配则回落 WORKBENCH_TOKEN）
   // 模型云 key（快 chat 直连 HiLinkup；full 路径回落 DeepSeek 云端点；均非 Anthropic 官方）
   "HILINKUP_API_KEY",
   "HILINKUP_BASE_URL",
