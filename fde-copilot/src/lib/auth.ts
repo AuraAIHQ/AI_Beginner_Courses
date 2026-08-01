@@ -50,20 +50,12 @@ export function originError(req: Request): NextResponse | null {
   return null;
 }
 
-/**
- * 第一方浏览器控制台识别 —— 修复：WORKBENCH_TOKEN 被当作 /_store(D1) 共享密钥 + hack5
- * 服务端鉴权设进生产后，authError/scopedAuthError 对**所有**请求都要求该 token；但
- * workbench.aastar.io 自己的浏览器 UI（Workbench.tsx 的 fetch）无从持有服务端密钥 →
- * 建客户/建项目/chat 每个操作都 401，整个控制台不可用。
- *
- * `Sec-Fetch-Site` 由浏览器设置、页面脚本无法伪造（forbidden request header），同源
- * fetch（GET/POST 皆然）恒为 `same-origin`；而服务端调用（hack5 Worker）与裸 curl 默认
- * 不带此头 → 仍落 token 门禁。故用它把「同源浏览器控制台」放行，同时保住 hack5/headless
- * 的共享密钥门禁。跨站页面打过来只会拿到 `cross-site`，且早已被 originError 挡在 403。
- */
-function firstPartyBrowser(req: Request): boolean {
-  return req.headers.get("sec-fetch-site") === "same-origin";
-}
+// ⚠️ 安全教训（PR #85 REQUEST_CHANGES / Codex PoC）：**不要**用 `Sec-Fetch-Site: same-origin`
+// 之类的请求头做鉴权豁免。该头只有在**浏览器页面 JS**里才伪造不了（forbidden request header），
+// 而 curl/脚本等非浏览器客户端可任意填写——中间没有浏览器把关。曾经的 firstPartyBrowser() 豁免
+// 导致「无 Origin + 伪造 Sec-Fetch-Site」零认证绕过 WORKBENCH_TOKEN（建客户/项目、跑 chat 吃计费、
+// 读 usage）。已移除。第一方浏览器控制台若要免密钥,必须用**客户端无法自填的凭据**：Cloudflare
+// Access（边缘鉴权）或服务端签发的登录 session cookie（HMAC 签名 + httpOnly），不是请求头。
 
 /**
  * 最小鉴权（admin / 编排层）：若设了 WORKBENCH_TOKEN，则所有 API 需带 `x-workbench-token`
@@ -72,12 +64,10 @@ function firstPartyBrowser(req: Request): boolean {
  *
  * 契约 v2 · B3：编排类调用（clients / projects / commit / usage）走此 admin 门禁；
  * 参赛者会话（chat / 读自己项目）走 scopedAuthError（作用域 token）。
- * 同源浏览器控制台（firstPartyBrowser）豁免 token——其准入凭据是 origin/sec-fetch，非密钥。
  */
 export function authError(req: Request): NextResponse | null {
   const oe = originError(req);
   if (oe) return oe;
-  if (firstPartyBrowser(req)) return null;
   const token = process.env.WORKBENCH_TOKEN?.trim();
   if (!token) return null;
   const got = req.headers.get("x-workbench-token");
@@ -140,9 +130,7 @@ export function scopedAuthError(
 ): NextResponse | null {
   const oe = originError(req);
   if (oe) return oe;
-  // 同源浏览器控制台（workbench.aastar.io 自己的 UI）豁免 token，同 authError。
-  // 参赛者经 hack5 是服务端调用/跨站（无 same-origin），仍须作用域 token。
-  if (firstPartyBrowser(req)) return null;
+  // 已移除 firstPartyBrowser(Sec-Fetch-Site) 豁免 —— 请求头可被非浏览器客户端伪造,不能做鉴权(见上)。
   const admin = process.env.WORKBENCH_TOKEN?.trim();
   const secret = process.env.WORKBENCH_SCOPED_SECRET?.trim();
   // 都没配 → 仅本机使用，放行（与 authError 语义一致）
