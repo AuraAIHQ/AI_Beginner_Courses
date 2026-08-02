@@ -6,6 +6,8 @@ import {
   ensureProjectWorkset,
   snapshotWorkset,
   withProjectLock,
+  conversationSize,
+  truncateConversation,
 } from "@/lib/clients";
 import { runTurn } from "@/lib/agent";
 import { commitProject, type CommitResult } from "@/lib/git";
@@ -88,6 +90,9 @@ async function runChatTurn(
   }
 
   const now = new Date().toISOString();
+  // 回滚点：agent 挂了就把这条客户输入撤掉，否则用户重试后历史里会留下两条一样的输入，
+  // 而且下一轮 agent 还会把这段脏历史当上下文。持锁中，截断不会误伤并发请求。
+  const rollbackTo = await conversationSize(clientSlug, projectSlug);
   await appendConversation(clientSlug, projectSlug, {
     role: "customer",
     at: now,
@@ -99,6 +104,7 @@ async function runChatTurn(
   try {
     out = await runTurn({ clientSlug, projectSlug, customerInput: input, attachments, lang: normLang(lang) });
   } catch (e) {
+    await truncateConversation(clientSlug, projectSlug, rollbackTo);
     return NextResponse.json({ error: `agent 执行失败：${(e as Error).message}` }, { status: 500 });
   }
 

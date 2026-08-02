@@ -224,7 +224,8 @@ function capEntryForBackup(line: string): string {
     const e = JSON.parse(line) as ConversationEntry;
     base = { role: e.role, at: e.at, text: (e.text ?? "").slice(0, 2000) + note };
   } catch {
-    base = { role: "customer", at: new Date().toISOString(), text: note };
+    // 固定值,不能用 new Date():同一行每次整形结果必须完全一致,否则「满块不再变化」的增量前提就破了。
+    base = { role: "customer", at: "", text: note };
   }
   return JSON.stringify(base);
 }
@@ -581,6 +582,33 @@ export async function appendConversation(clientSlug: string, projectSlug: string
     await backupConversation(clientSlug, projectSlug);
   } catch (e) {
     console.error(`[workset] 会话增量备份失败（轮末会全量重试）：${(e as Error).message}`);
+  }
+}
+
+/**
+ * 会话字节长度 —— 配合 truncateConversation 做「本轮失败就回滚刚追加的那条」。
+ * 不存在时返回 0（回滚到 0 即清空，语义正确）。
+ */
+export async function conversationSize(clientSlug: string, projectSlug: string): Promise<number> {
+  try {
+    const s = await fs.stat(path.join(projectDir(clientSlug, projectSlug), "conversation.jsonl"));
+    return s.size;
+  } catch {
+    return 0;
+  }
+}
+
+/**
+ * 回滚到指定字节长度：agent 跑挂时，客户那条输入已经落盘了，留着它会让用户重试后在历史里看到
+ * 两条一模一样的输入（agent 下一轮还会把这段脏历史当上下文）。调用方必须持有项目锁 —— 否则
+ * 会截掉别的并发请求刚追加的内容。
+ */
+export async function truncateConversation(clientSlug: string, projectSlug: string, size: number): Promise<void> {
+  try {
+    await fs.truncate(path.join(projectDir(clientSlug, projectSlug), "conversation.jsonl"), size);
+    await backupConversation(clientSlug, projectSlug, true); // 全量重写,让备份跟着回滚(块数可能变少)
+  } catch (e) {
+    console.error(`[workset] ${clientSlug}/${projectSlug} 会话回滚失败：${(e as Error).message}`);
   }
 }
 

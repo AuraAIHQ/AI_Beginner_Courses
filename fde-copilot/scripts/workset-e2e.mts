@@ -198,4 +198,18 @@ await Promise.all([bump(), bump(), bump(), bump(), bump()]);
 const 并发后 = await C.readProjectState("acme-客户", "并发项目");
 ok("5 个并发轮次一个不丢（锁生效）", 并发后?.rounds === 5, `rounds=${并发后?.rounds}（起始 ${并发.rounds}）`);
 
+// —— 场景 12：agent 跑挂时回滚刚追加的客户输入（否则重试后历史里留两条一样的输入）——
+const 回滚 = await C.createProject("acme-客户", "回滚项目", { name: "回滚", type: "doc" });
+await C.appendConversation("acme-客户", "回滚项目", { role: "customer", at: "t1", text: "第一条" });
+const 回滚点 = await C.conversationSize("acme-客户", "回滚项目");
+await C.appendConversation("acme-客户", "回滚项目", { role: "customer", at: "t2", text: "agent 会挂的这条" });
+await C.truncateConversation("acme-客户", "回滚项目", 回滚点);
+const conv5 = await C.readConversation("acme-客户", "回滚项目");
+ok("失败轮的孤儿输入已回滚", conv5.length === 1 && conv5[0].text === "第一条", `len=${conv5.length}`);
+await C.writeProjectState({ ...回滚, rounds: 1 });
+await fs.rm(C.projectDir("acme-客户", "回滚项目"), { recursive: true, force: true });
+await C.ensureProjectWorkset("acme-客户", "回滚项目");
+const conv6 = await C.readConversation("acme-客户", "回滚项目");
+ok("备份也跟着回滚了（恢复出来不含孤儿条）", conv6.length === 1 && conv6[0].text === "第一条", `len=${conv6.length}`);
+
 server.close();
