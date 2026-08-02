@@ -122,4 +122,80 @@ for (const k of [...kv.keys()]) if (k.includes("半丢项目/workset/conv/")) kv
 const ws6 = await C.ensureProjectWorkset("acme-客户", "半丢项目");
 ok("文档在会话丢 → lost（不乐观判 restored）", ws6.kind === "lost", JSON.stringify(ws6));
 
+// —— 场景 6（Codex review Blocking#1）：只有会话备份、没有文档备份 → lost，且**盘上不留半成品**，
+//    否则下次调用 present 判据（conversation.jsonl 存在）会命中，409 静默退化成「继续在残缺工作集上跑」——
+const conv只 = await C.createProject("acme-客户", "只有会话", { name: "只有会话", type: "doc" });
+const conv只Dir = C.projectDir("acme-客户", "只有会话");
+await C.appendConversation("acme-客户", "只有会话", { role: "customer", at: "t", text: "有历史的" });
+await C.snapshotWorkset("acme-客户", "只有会话");
+await C.writeProjectState({ ...conv只, rounds: 4 });
+await fs.rm(conv只Dir, { recursive: true, force: true });
+for (const k of [...kv.keys()]) if (k.includes("只有会话/workset/docs/")) kv.delete(k);
+const ws7 = await C.ensureProjectWorkset("acme-客户", "只有会话");
+ok("只有会话备份 → lost", ws7.kind === "lost", JSON.stringify(ws7));
+ok("lost 时盘上零字节（不留半成品 conversation.jsonl）", ((await fs.readdir(conv只Dir).catch(() => [])) as string[]).length === 0);
+const ws8 = await C.ensureProjectWorkset("acme-客户", "只有会话");
+ok("再次调用仍是 lost（没被 present 误判绕过）", ws8.kind === "lost", JSON.stringify(ws8));
+
+// —— 场景 7（Codex Blocking#2）：中间块缺失 → 整份判不可恢复，绝不把前缀当完整历史 ——
+const 缺块 = await C.createProject("acme-客户", "缺块项目", { name: "缺块", type: "doc" });
+await fs.writeFile(path.join(C.projectDir("acme-客户", "缺块项目"), "SPEC.md"), "# 有文档\n", "utf8");
+for (let i = 0; i < 400; i++) {
+  await C.appendConversation("acme-客户", "缺块项目", { role: "customer", at: `t${i}`, text: "长会话-".repeat(200) + i });
+}
+await C.snapshotWorkset("acme-客户", "缺块项目");
+await C.writeProjectState({ ...缺块, rounds: 5 });
+await fs.rm(C.projectDir("acme-客户", "缺块项目"), { recursive: true, force: true });
+kv.delete([...kv.keys()].find((k) => k.includes("缺块项目/workset/conv/00001.jsonl"))!); // 打掉中间一块
+const ws9 = await C.ensureProjectWorkset("acme-客户", "缺块项目");
+ok("中间块缺失 → lost（不静默截断历史）", ws9.kind === "lost", JSON.stringify(ws9));
+
+// —— 场景 8（Codex Blocking#2 后半）：reset 后块数变少，旧尾巴不得复活 ——
+const ws10 = await C.ensureProjectWorkset("acme-客户", "缺块项目", { acceptLoss: true });
+ok("reset 保留可恢复的文档（不把能救的扔掉）", ws10.kind === "reset" && ws10.restoredDocs > 0, JSON.stringify(ws10));
+ok("reset 恢复的是文档真内容", (await C.readDoc("acme-客户", "缺块项目", "SPEC.md"))?.includes("有文档") === true);
+
+await C.appendConversation("acme-客户", "缺块项目", { role: "customer", at: "new", text: "重建后的第一条" });
+await fs.rm(C.projectDir("acme-客户", "缺块项目"), { recursive: true, force: true });
+const ws11a = await C.ensureProjectWorkset("acme-客户", "缺块项目");
+const conv3 = await C.readConversation("acme-客户", "缺块项目");
+ok("reset 后块数变少，恢复只拿到新会话、旧尾巴没复活",
+  ws11a.kind === "restored" && conv3.length === 1 && conv3[0].text === "重建后的第一条",
+  `len=${conv3.length} kind=${ws11a.kind}`);
+
+// —— 场景 9（Codex High#5）：单条超 1MB 的 entry 不能把整个项目的备份写挂 ——
+const 巨大 = await C.createProject("acme-客户", "巨大条目", { name: "巨大", type: "doc" });
+await C.appendConversation("acme-客户", "巨大条目", { role: "customer", at: "big", text: "啊".repeat(600_000) });
+await C.snapshotWorkset("acme-客户", "巨大条目");
+await C.writeProjectState({ ...巨大, rounds: 1 });
+await fs.rm(C.projectDir("acme-客户", "巨大条目"), { recursive: true, force: true });
+const ws11 = await C.ensureProjectWorkset("acme-客户", "巨大条目");
+const conv4 = await C.readConversation("acme-客户", "巨大条目");
+ok("超大 entry 仍能备份+恢复（占位替换而非写挂）", ws11.kind === "restored" && conv4.length === 1, JSON.stringify(ws11));
+ok("占位如实说明被替换", conv4[0]?.text.includes("备份中已替换为占位") === true, conv4[0]?.text.slice(-30));
+
+// —— 场景 10（Codex Medium#8）：损坏行不得让恢复吐出会 500 的会话 ——
+const 坏行 = await C.createProject("acme-客户", "坏行项目", { name: "坏行", type: "doc" });
+await fs.writeFile(path.join(C.projectDir("acme-客户", "坏行项目"), "SPEC.md"), "# doc\n", "utf8");
+await C.appendConversation("acme-客户", "坏行项目", { role: "customer", at: "t", text: "正常" });
+await C.snapshotWorkset("acme-客户", "坏行项目");
+await C.writeProjectState({ ...坏行, rounds: 2 });
+await fs.rm(C.projectDir("acme-客户", "坏行项目"), { recursive: true, force: true });
+const 坏块 = [...kv.keys()].find((k) => k.includes("坏行项目/workset/conv/00000.jsonl"))!;
+kv.set(坏块, kv.get(坏块)! + "{这不是合法 JSON\n");
+const ws12 = await C.ensureProjectWorkset("acme-客户", "坏行项目");
+ok("会话备份含损坏行 → lost（不把 500 埋进详情接口）", ws12.kind === "lost", JSON.stringify(ws12));
+
+// —— 场景 11（Codex Blocking#3）：同项目并发必须串行，rounds/usage 不能互相覆盖 ——
+const 并发 = await C.createProject("acme-客户", "并发项目", { name: "并发", type: "doc" });
+const bump = () =>
+  C.withProjectLock("acme-客户", "并发项目", async () => {
+    const s = (await C.readProjectState("acme-客户", "并发项目"))!;
+    await new Promise((r) => setTimeout(r, 5)); // 放大 read-modify-write 窗口
+    await C.writeProjectState({ ...s, rounds: s.rounds + 1 });
+  });
+await Promise.all([bump(), bump(), bump(), bump(), bump()]);
+const 并发后 = await C.readProjectState("acme-客户", "并发项目");
+ok("5 个并发轮次一个不丢（锁生效）", 并发后?.rounds === 5, `rounds=${并发后?.rounds}（起始 ${并发.rounds}）`);
+
 server.close();

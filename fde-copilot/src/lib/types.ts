@@ -104,6 +104,11 @@ export interface ProjectState {
    */
   worksetLostAt?: string;
   worksetLostAtRound?: number;
+  /**
+   * CC-77：最近一次工作集备份失败的时刻（备份失败不阻断本轮，但绝不能假装备份还在）。
+   * 非空 = 这个项目当前**没有**可信备份，容器再重启就会真丢；下一轮备份成功即清空。
+   */
+  worksetBackupDirtyAt?: string;
 }
 
 export const SPEC_DOCS = [

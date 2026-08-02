@@ -45,6 +45,36 @@ async function exists(p: string): Promise<boolean> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// 同项目串行锁（review #85：并发 /api/chat 丢轮次 + 丢计费）
+//
+// state 的更新是 read-modify-write（rounds+1、usage 累加），工作集备份也是「读全量文件 → 重算末块
+// → 写回」。同一项目两个并发请求会互相覆盖：两轮都读到 rounds=N，都写 N+1 → 少记一轮，usage 也只
+// 剩后写者那份 → 结算直接漏账；较早请求的 stale 末块还可能盖掉较晚请求刚写的备份。
+//
+// 语义上同一项目的对话本来就该串行，故直接把「读 state → 跑一轮 → 写 state」整段串行化。
+// **限界**：进程内锁，只在当前部署形态（CF Container 单例）下成立。若将来横向扩容多实例，
+// 必须换成 Durable Object 或 D1 上的 CAS/版本号 —— 别把这个锁当成分布式互斥。
+// ─────────────────────────────────────────────────────────────────────────────
+const projectLocks = new Map<string, Promise<void>>();
+
+export function withProjectLock<T>(clientSlug: string, projectSlug: string, fn: () => Promise<T>): Promise<T> {
+  const key = `${clientSlug}/${projectSlug}`;
+  const prev = projectLocks.get(key) ?? Promise.resolve();
+  // 前一个失败也必须放行下一个，否则一次异常会把这个项目永久锁死。
+  const run = prev.then(fn, fn);
+  const settled = run.then(
+    () => {},
+    () => {},
+  );
+  projectLocks.set(key, settled);
+  // 自己是队尾时清理，避免 Map 随项目数无界增长。
+  void settled.then(() => {
+    if (projectLocks.get(key) === settled) projectLocks.delete(key);
+  });
+  return run;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // CC-77 · 持久元数据存储（client.json / state.json / conversation.jsonl）
 //
 // 病根：fde-copilot 跑在单例 CF Container，clients/ 只写容器本地盘 + gitignored，
@@ -164,6 +194,13 @@ const CONV_CHUNK_BYTES = 192 * 1024; // D1 单值上限 2MB，UTF-8 多字节 + 
 const worksetDocKey = (c: string, p: string, file: string) => `${c}/projects/${p}/workset/docs/${file}`;
 const worksetConvKey = (c: string, p: string, i: number) =>
   `${c}/projects/${p}/workset/conv/${String(i).padStart(5, "0")}.jsonl`;
+/**
+ * 会话块数 = 恢复时的**提交点**。没有它就只能「读到第一个缺失的块为止」，而块数只增不减的假设会被
+ * reset（从空白重建）打破：旧会话留下 5 块残留，新会话只写 1 块，恢复时会把旧历史拼到新会话后面。
+ * MetaStore 没有 delete（Worker shim 只有 get/put/exists/list），故用块数覆盖旧残块而非删除。
+ * 写序：**先写块、后写 count** —— 中途崩溃只会少恢复最后一块，绝不错序拼接。
+ */
+const worksetConvCountKey = (c: string, p: string) => `${c}/projects/${p}/workset/conv/count`;
 
 /**
  * 只有远端 store（生产 D1）才需要镜像：本地 FsMetaStore 的盘本身就是持久的，
@@ -171,9 +208,34 @@ const worksetConvKey = (c: string, p: string, i: number) =>
  */
 const MIRROR_WORKSET = !!process.env.WORKBENCH_STORE_URL?.trim();
 
-/** 按行切块，每块 ≤ CONV_CHUNK_BYTES（单行超限时自成一块，不截断）。 */
+/**
+ * 单条 entry 的备份上限。D1 单值上限 2MB —— 超过它 meta.write 会直接失败，把「某人贴了一篇超长文」
+ * 变成「这个项目从此备份不上」。故超限行在**备份里**替换为占位（盘上仍是全量原文），并在占位文本里
+ * 明说它不可恢复 —— 这是有意的信息损失，不是静默截断。
+ */
+const MAX_ENTRY_BYTES = 1024 * 1024;
+
+/** 备份用的行整形：超限 entry 换成同结构的占位，保证仍是合法 JSONL。 */
+function capEntryForBackup(line: string): string {
+  if (Buffer.byteLength(line, "utf8") <= MAX_ENTRY_BYTES) return line;
+  const note = "…（本条超过 1MB，备份中已替换为占位；完整原文只在容器盘上，重启后不可恢复）";
+  let base: Partial<ConversationEntry> = {};
+  try {
+    const e = JSON.parse(line) as ConversationEntry;
+    base = { role: e.role, at: e.at, text: (e.text ?? "").slice(0, 2000) + note };
+  } catch {
+    base = { role: "customer", at: new Date().toISOString(), text: note };
+  }
+  return JSON.stringify(base);
+}
+
+/**
+ * 按行切块，每块 ≤ CONV_CHUNK_BYTES。**例外**：单行本身超过 CONV_CHUNK_BYTES 时自成一块且超限
+ * （不按字节硬切，那会切断多字节 UTF-8 字符、也会切出非法 JSONL）；capEntryForBackup 已把
+ * 真正危险的（>1MB）挡在前面，故实际落到 store 的块最大约 1MB，仍在 D1 单值上限内。
+ */
 function chunkConversation(raw: string): string[] {
-  const lines = raw.split("\n").filter(Boolean).map((l) => l + "\n");
+  const lines = raw.split("\n").filter(Boolean).map((l) => capEntryForBackup(l) + "\n");
   const out: string[] = [];
   let cur = "";
   let curBytes = 0;
@@ -206,6 +268,7 @@ async function backupConversation(clientSlug: string, projectSlug: string, full 
   for (let i = from; i < chunks.length; i++) {
     await meta.write(worksetConvKey(clientSlug, projectSlug, i), chunks[i]);
   }
+  await meta.write(worksetConvCountKey(clientSlug, projectSlug), String(chunks.length));
 }
 
 /**
@@ -229,29 +292,63 @@ export async function snapshotWorkset(clientSlug: string, projectSlug: string): 
   await backupConversation(clientSlug, projectSlug, true);
 }
 
-/** 从 store 备份写回盘。docs/conv 分开计数 —— 会话没恢复出来 = agent 仍在零上文下跑，得单独判。 */
-async function restoreWorkset(
+/**
+ * 从 store 读出备份 —— **只读进内存，不落盘**。
+ *
+ * 落盘必须等 ensureProjectWorkset 判定「这份备份够用」之后再做（见 commitRestore）：否则备份不完整
+ * 时盘上会留下半成品 conversation.jsonl，而它正是 present 的判据 —— 下一次调用就会把 lost 误判成
+ * present，409 退化回「静默在残缺工作集上继续」，等于绕开本次修复。docs/conv 分开计数：会话没恢复
+ * 出来 = agent 仍在零上文下跑，与全丢同类。
+ */
+async function readWorksetBackup(
   clientSlug: string,
   projectSlug: string,
-  dir: string,
-): Promise<{ docs: number; conv: number }> {
-  if (!MIRROR_WORKSET) return { docs: 0, conv: 0 };
-  let docs = 0;
+): Promise<{ docs: Record<string, string>; conv: string | null; convChunks: number }> {
+  if (!MIRROR_WORKSET) return { docs: {}, conv: null, convChunks: 0 };
+  const docs: Record<string, string> = {};
   for (const f of SPEC_DOCS) {
     const v = await meta.read(worksetDocKey(clientSlug, projectSlug, f));
-    if (v != null) {
-      await fs.writeFile(path.join(dir, f), v, "utf8");
-      docs++;
-    }
+    if (v != null) docs[f] = v;
   }
+  // 按 count 读，而不是「读到第一个缺失为止」—— 后者会把 reset 前的残留旧块也拼进来（见 worksetConvCountKey）。
+  const rawCount = await meta.read(worksetConvCountKey(clientSlug, projectSlug));
+  const count = Number(rawCount);
+  if (!rawCount || !Number.isInteger(count) || count <= 0) return { docs, conv: null, convChunks: 0 };
   const parts: string[] = [];
-  for (let i = 0; ; i++) {
+  for (let i = 0; i < count; i++) {
     const v = await meta.read(worksetConvKey(clientSlug, projectSlug, i));
-    if (v == null) break;
+    // 块缺失 = 备份不完整。**不截断**：把前缀当完整历史交出去，就是把「丢了一半会话」伪装成
+    // 恢复成功，与本次修复要根治的静默失忆同类。整份判为不可用，交由 lost 分支响亮报错。
+    if (v == null) {
+      console.error(`[workset] ${clientSlug}/${projectSlug} 会话备份缺第 ${i}/${count} 块，判为不可恢复`);
+      return { docs, conv: null, convChunks: 0 };
+    }
     parts.push(v);
   }
-  if (parts.length > 0) await fs.writeFile(path.join(dir, "conversation.jsonl"), parts.join(""), "utf8");
-  return { docs, conv: parts.length };
+  const conv = parts.join("");
+  // 完整性校验：拼出来的每行都必须是可解析的 JSONL，否则 readConversation() 会在后续任意一次
+  // 项目详情请求里抛出、变成随机 500。宁可判不可恢复。
+  for (const line of conv.split("\n")) {
+    if (!line) continue;
+    try {
+      JSON.parse(line);
+    } catch {
+      console.error(`[workset] ${clientSlug}/${projectSlug} 会话备份含损坏行，判为不可恢复`);
+      return { docs, conv: null, convChunks: 0 };
+    }
+  }
+  return { docs, conv, convChunks: parts.length };
+}
+
+/** 把已判定可用的备份落盘。只在 ensureProjectWorkset 判 restored 后调用。 */
+async function commitRestore(
+  dir: string,
+  backup: { docs: Record<string, string>; conv: string | null },
+): Promise<void> {
+  await Promise.all(
+    Object.entries(backup.docs).map(([f, c]) => fs.writeFile(path.join(dir, f), c, "utf8")),
+  );
+  if (backup.conv != null) await fs.writeFile(path.join(dir, "conversation.jsonl"), backup.conv, "utf8");
 }
 
 // —— 客户 ——
@@ -386,7 +483,9 @@ export type WorksetState =
   | { kind: "present" }                       // 盘上完好
   | { kind: "restored"; files: number }       // 冷启后从备份写回，内容真恢复了
   | { kind: "fresh" }                         // 确无历史（rounds=0）→ 铺模板安全
-  | { kind: "reset"; rounds: number }         // 有历史且无法恢复，用户显式确认后从空白重建
+  // 有历史且会话无法恢复，用户显式确认后重建。restoredDocs>0 = 文档备份还在、已恢复真内容，
+  // 丢的只是会话历史 —— 别把这种情况说成「从空白重建」，也别把能救的文档扔掉。
+  | { kind: "reset"; rounds: number; restoredDocs: number }
   | { kind: "lost"; rounds: number };         // 有历史且无法恢复，未获确认 → 调用方必须拒绝本次操作
 
 /**
@@ -411,31 +510,43 @@ export async function ensureProjectWorkset(
   // 三条路径都会建它，且 agent 不会删它。
   if (await exists(path.join(dir, "conversation.jsonl"))) return { kind: "present" };
 
-  await fs.mkdir(dir, { recursive: true });
-  const r = await restoreWorkset(clientSlug, projectSlug, dir);
+  const backup = await readWorksetBackup(clientSlug, projectSlug);
+  const docCount = Object.keys(backup.docs).length;
   // 会话必须一并恢复：rounds>0 却没恢复出会话，等于 agent 照样在零上文下继续跑（文档恢复了也一样），
   // 与「全丢」同类，按 lost 处理，不做「恢复了一半」的乐观判定。
-  const convOk = state.rounds === 0 || r.conv > 0;
-  if (r.docs > 0 && convOk) {
+  const convOk = state.rounds === 0 || backup.convChunks > 0;
+  if (docCount > 0 && convOk) {
+    await fs.mkdir(dir, { recursive: true });
+    await commitRestore(dir, backup);
     // 备份恢复出的文档可能少于 7 个（某轮镜像失败）：补齐缺的空模板，不动恢复到的。
     const client = await readClient(clientSlug);
     await scaffoldWorkset(
       clientSlug, projectSlug, client?.name ?? clientSlug, state.name, state.deliverable, state.createdAt,
     );
-    return { kind: "restored", files: r.docs + r.conv };
+    return { kind: "restored", files: docCount + backup.convChunks };
   }
 
+  // 判定不通过 → 盘上保持原样（一个字节都不落），确保下次调用仍走同一条 lost 分支而非误判 present。
   if (state.rounds > 0 && !opts.acceptLoss) return { kind: "lost", rounds: state.rounds };
+  await fs.mkdir(dir, { recursive: true });
+
+  // 用户已确认接受丢失。但「接受丢失」不等于「把还救得回来的也扔掉」：文档备份若在，照样恢复真内容，
+  // 丢的仅是会话历史。恢复到的文档不加横幅（它们是真内容），横幅只落在确实凭空重建的空模板上。
+  if (docCount > 0) await commitRestore(dir, { docs: backup.docs, conv: null });
 
   const client = await readClient(clientSlug);
   const banner =
     state.rounds > 0
-      ? `\n> ⚠️ 工作集已随容器重启丢失（丢失时第 ${state.rounds} 轮），内容**未恢复**；以下为空模板重建。\n> 此前生成的文档请到 git 交付仓库找回。\n`
+      ? docCount > 0
+        ? `\n> ⚠️ 会话历史已随容器重启丢失（丢失时第 ${state.rounds} 轮），文档已从备份恢复，但本文件当时没有备份，为空模板重建。\n`
+        : `\n> ⚠️ 工作集已随容器重启丢失（丢失时第 ${state.rounds} 轮），内容**未恢复**；以下为空模板重建。\n> 此前生成的文档请到 git 交付仓库找回。\n`
       : "";
   await scaffoldWorkset(
     clientSlug, projectSlug, client?.name ?? clientSlug, state.name, state.deliverable, state.createdAt, banner,
   );
-  return state.rounds > 0 ? { kind: "reset", rounds: state.rounds } : { kind: "fresh" };
+  return state.rounds > 0
+    ? { kind: "reset", rounds: state.rounds, restoredDocs: docCount }
+    : { kind: "fresh" };
 }
 
 // —— 文档（挂在项目下，工作集，走文件系统）——
@@ -463,7 +574,14 @@ export async function appendConversation(clientSlug: string, projectSlug: string
   // 防御性:冷启后目录可能随 ephemeral 盘丢失,fs.appendFile 不建父目录 → 否则 ENOENT 500(见 ensureProjectWorkset)。
   await fs.mkdir(dir, { recursive: true });
   await fs.appendFile(path.join(dir, "conversation.jsonl"), JSON.stringify(entry) + "\n", "utf8");
-  await backupConversation(clientSlug, projectSlug);
+  // 备份失败不阻断本轮：盘上已经写成功了，这里再抛就把「store 抖一下」升级成「聊天不可用」，
+  // 而且抛在 runTurn 之前/之后都会让整轮白跑、state.usage 写不进去（正是本 PR 要修的那类问题）。
+  // 轮末 snapshotWorkset(full=true) 会全量补写自愈；那一次仍然失败才是真警报，由路由暴露给用户。
+  try {
+    await backupConversation(clientSlug, projectSlug);
+  } catch (e) {
+    console.error(`[workset] 会话增量备份失败（轮末会全量重试）：${(e as Error).message}`);
+  }
 }
 
 export async function readConversation(clientSlug: string, projectSlug: string): Promise<ConversationEntry[]> {
@@ -472,5 +590,15 @@ export async function readConversation(clientSlug: string, projectSlug: string):
   const p = path.join(dir, "conversation.jsonl");
   if (!(await exists(p))) return [];
   const raw = await fs.readFile(p, "utf8");
-  return raw.split("\n").filter(Boolean).map((l) => JSON.parse(l) as ConversationEntry);
+  // 坏行跳过而不是抛：一条半截行（写盘中途断电/进程被杀）不该让项目详情整个 500 打不开。
+  const out: ConversationEntry[] = [];
+  for (const l of raw.split("\n")) {
+    if (!l) continue;
+    try {
+      out.push(JSON.parse(l) as ConversationEntry);
+    } catch {
+      console.error(`[workset] ${clientSlug}/${projectSlug} conversation.jsonl 含损坏行，已跳过`);
+    }
+  }
+  return out;
 }

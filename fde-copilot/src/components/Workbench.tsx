@@ -303,7 +303,15 @@ export default function Workbench() {
       else {
         const res = j.result as TurnResult;
         if (j.workset?.kind === "restored") flash("容器曾重启，工作集已从备份恢复");
-        if (j.workset?.kind === "reset") flash(`工作集已丢失，本项目从空白重建（原第 ${j.workset.rounds} 轮）`, true);
+        if (j.workset?.kind === "reset")
+          flash(
+            j.workset.restoredDocs > 0
+              ? `会话历史已丢失（原第 ${j.workset.rounds} 轮），文档已从备份恢复`
+              : `工作集已丢失，本项目从空白重建（原第 ${j.workset.rounds} 轮）`,
+            true,
+          );
+        // 这轮结果保住了，但备份没写成 —— 容器再重启就真丢，必须让用户看见。
+        if (j.worksetBackupFailed) flash(`⚠️ 本轮备份失败，容器重启将丢失：${j.worksetBackupFailed}`, true);
         if (j.usedFallback) flash("未返回结构化结果，已用兜底文本", true);
         if (res.readiness.loop_ready) flash("🎉 规格已达 loop-ready！");
       }
