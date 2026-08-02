@@ -264,7 +264,13 @@ async function backupConversation(clientSlug: string, projectSlug: string, full 
     return;
   }
   const chunks = chunkConversation(raw);
-  if (chunks.length === 0) return;
+  // 空会话也必须把 count 写成 0：失败轮回滚（truncateConversation）会把会话清空，此时若直接 return，
+  // store 里还留着旧 count 和旧块 → 冷启会把那条已被撤销的输入原样恢复回来。
+  // 注意与「文件读不到」区分：那种情况上面已 return，不动 count（目录丢了不等于会话被清空）。
+  if (chunks.length === 0) {
+    await meta.write(worksetConvCountKey(clientSlug, projectSlug), "0");
+    return;
+  }
   const from = full ? 0 : chunks.length - 1;
   for (let i = from; i < chunks.length; i++) {
     await meta.write(worksetConvKey(clientSlug, projectSlug, i), chunks[i]);
@@ -341,15 +347,30 @@ async function readWorksetBackup(
   return { docs, conv, convChunks: parts.length };
 }
 
-/** 把已判定可用的备份落盘。只在 ensureProjectWorkset 判 restored 后调用。 */
+/**
+ * 把已判定可用的备份落盘。只在 ensureProjectWorkset 判 restored/reset 后调用。
+ *
+ * **一律 wx（只补不覆盖）**：详情 GET 故意不进项目锁（chat 可能持锁几分钟，详情读不该被堵死），
+ * 于是存在这个时序 —— chat 恢复完成后已经追加了客户输入，稍慢的并发 GET 才走到落盘，若用覆盖写
+ * 就会把旧备份的 conversation 盖回去、直接吃掉刚追加的输入，之后 snapshot 还会把这个损坏状态写回
+ * 备份。wx 之后谁先建谁赢，落后的一方全部 EEXIST 跳过；两边内容同源，故谁赢都一样。
+ */
 async function commitRestore(
   dir: string,
   backup: { docs: Record<string, string>; conv: string | null },
 ): Promise<void> {
-  await Promise.all(
-    Object.entries(backup.docs).map(([f, c]) => fs.writeFile(path.join(dir, f), c, "utf8")),
-  );
-  if (backup.conv != null) await fs.writeFile(path.join(dir, "conversation.jsonl"), backup.conv, "utf8");
+  await Promise.all(Object.entries(backup.docs).map(([f, c]) => writeIfAbsent(path.join(dir, f), c)));
+  // conversation.jsonl 最后写：它是 present 的判据，先写它会让「落盘中途崩溃」被下次调用误判成完好。
+  if (backup.conv != null) await writeIfAbsent(path.join(dir, "conversation.jsonl"), backup.conv);
+}
+
+/** 只在文件不存在时写。EEXIST 即放弃，绝不覆盖别人（并发请求 / 本会话已生成的内容）写下的字节。 */
+async function writeIfAbsent(p: string, content: string): Promise<void> {
+  try {
+    await fs.writeFile(p, content, { encoding: "utf8", flag: "wx" });
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
+  }
 }
 
 // —— 客户 ——
@@ -465,13 +486,6 @@ async function scaffoldWorkset(
   const dir = projectDir(clientSlug, projectSlug);
   await fs.mkdir(dir, { recursive: true });
   const scaffold = docScaffold(clientName, projectName, deliverable, createdAt.slice(0, 10), banner);
-  const writeIfAbsent = async (p: string, c: string) => {
-    try {
-      await fs.writeFile(p, c, { encoding: "utf8", flag: "wx" });
-    } catch (e) {
-      if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
-    }
-  };
   await Promise.all(Object.entries(scaffold).map(([f, c]) => writeIfAbsent(path.join(dir, f), c)));
   await writeIfAbsent(path.join(dir, "conversation.jsonl"), "");
 }
@@ -487,7 +501,9 @@ export type WorksetState =
   // 有历史且会话无法恢复，用户显式确认后重建。restoredDocs>0 = 文档备份还在、已恢复真内容，
   // 丢的只是会话历史 —— 别把这种情况说成「从空白重建」，也别把能救的文档扔掉。
   | { kind: "reset"; rounds: number; restoredDocs: number }
-  | { kind: "lost"; rounds: number };         // 有历史且无法恢复，未获确认 → 调用方必须拒绝本次操作
+  // 有历史且无法恢复，未获确认 → 调用方必须拒绝本次操作。
+  // staleSince 非空 = 备份**存在但已知过期**（上次备份失败的时刻），恢复它会把用户退回更早一轮。
+  | { kind: "lost"; rounds: number; staleSince?: string };
 
 /**
  * 冷启动水合（PR #85 review）：CF 容器盘 ephemeral，重启后 D1 里仍有 client/state，
@@ -516,7 +532,11 @@ export async function ensureProjectWorkset(
   // 会话必须一并恢复：rounds>0 却没恢复出会话，等于 agent 照样在零上文下继续跑（文档恢复了也一样），
   // 与「全丢」同类，按 lost 处理，不做「恢复了一半」的乐观判定。
   const convOk = state.rounds === 0 || backup.convChunks > 0;
-  if (docCount > 0 && convOk) {
+  // 上一轮备份失败过 → store 里那份是**旧的**（比 state.rounds 落后至少一轮）。此时「恢复成功」
+  // 意味着悄悄把用户退回到上一轮的文档和会话，而 rounds/usage 还是新的 —— 又一次静默丢历史。
+  // 备份可用性必须以这个标记为准，不能只看「读出来有东西」。
+  const backupTrusted = !state.worksetBackupDirtyAt;
+  if (docCount > 0 && convOk && backupTrusted) {
     await fs.mkdir(dir, { recursive: true });
     await commitRestore(dir, backup);
     // 备份恢复出的文档可能少于 7 个（某轮镜像失败）：补齐缺的空模板，不动恢复到的。
@@ -528,26 +548,37 @@ export async function ensureProjectWorkset(
   }
 
   // 判定不通过 → 盘上保持原样（一个字节都不落），确保下次调用仍走同一条 lost 分支而非误判 present。
-  if (state.rounds > 0 && !opts.acceptLoss) return { kind: "lost", rounds: state.rounds };
+  const stale = backupTrusted ? undefined : state.worksetBackupDirtyAt;
+  if (state.rounds > 0 && !opts.acceptLoss) return { kind: "lost", rounds: state.rounds, staleSince: stale };
   await fs.mkdir(dir, { recursive: true });
 
-  // 用户已确认接受丢失。但「接受丢失」不等于「把还救得回来的也扔掉」：文档备份若在，照样恢复真内容，
-  // 丢的仅是会话历史。恢复到的文档不加横幅（它们是真内容），横幅只落在确实凭空重建的空模板上。
+  // 用户已确认接受丢失。但「接受丢失」不等于「把还救得回来的也扔掉」：文档备份若在，照样恢复真内容
+  // （备份过期时那是**上一轮**的文档，横幅会说清楚），丢的仅是会话历史。恢复到的文档不加横幅。
   if (docCount > 0) await commitRestore(dir, { docs: backup.docs, conv: null });
 
   const client = await readClient(clientSlug);
   const banner =
     state.rounds > 0
-      ? docCount > 0
-        ? `\n> ⚠️ 会话历史已随容器重启丢失（丢失时第 ${state.rounds} 轮），文档已从备份恢复，但本文件当时没有备份，为空模板重建。\n`
-        : `\n> ⚠️ 工作集已随容器重启丢失（丢失时第 ${state.rounds} 轮），内容**未恢复**；以下为空模板重建。\n> 此前生成的文档请到 git 交付仓库找回。\n`
+      ? stale
+        ? `\n> ⚠️ 工作集已随容器重启丢失（丢失时第 ${state.rounds} 轮），且最后一次备份失败于 ${stale} —— 文档恢复到的是**更早一轮**的版本，之后的改动与会话历史未恢复。\n`
+        : docCount > 0
+          ? `\n> ⚠️ 会话历史已随容器重启丢失（丢失时第 ${state.rounds} 轮），文档已从备份恢复，但本文件当时没有备份，为空模板重建。\n`
+          : `\n> ⚠️ 工作集已随容器重启丢失（丢失时第 ${state.rounds} 轮），内容**未恢复**；以下为空模板重建。\n> 此前生成的文档请到 git 交付仓库找回。\n`
       : "";
   await scaffoldWorkset(
     clientSlug, projectSlug, client?.name ?? clientSlug, state.name, state.deliverable, state.createdAt, banner,
   );
-  return state.rounds > 0
-    ? { kind: "reset", rounds: state.rounds, restoredDocs: docCount }
-    : { kind: "fresh" };
+  if (state.rounds === 0) return { kind: "fresh" };
+
+  // 横幅只落在**凭空重建的空模板**上 —— 文档若全部恢复成功（常见：备份过期但完整），一个空模板都不会
+  // 生成，横幅就没有落脚点，用户在文档里看不到任何异常提示。故把丢失事实另外记进 GAPS.md 台账
+  // （追加，不覆盖任何内容）：它会随下一次快照持久化，也会跟着 git 交付一起被看到。
+  await fs.appendFile(
+    path.join(dir, "GAPS.md"),
+    `\n## ⚠️ 工作集丢失记录\n${banner.trim().replace(/^> /gm, "- ")}\n`,
+    "utf8",
+  );
+  return { kind: "reset", rounds: state.rounds, restoredDocs: docCount };
 }
 
 // —— 文档（挂在项目下，工作集，走文件系统）——

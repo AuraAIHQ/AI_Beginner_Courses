@@ -212,4 +212,44 @@ await C.ensureProjectWorkset("acme-客户", "回滚项目");
 const conv6 = await C.readConversation("acme-客户", "回滚项目");
 ok("备份也跟着回滚了（恢复出来不含孤儿条）", conv6.length === 1 && conv6[0].text === "第一条", `len=${conv6.length}`);
 
+// —— 场景 13（Codex R2 Blocking#1）：并发恢复不得覆盖别人刚追加的内容（详情 GET 不进项目锁）——
+const 并发恢复 = await C.createProject("acme-客户", "并发恢复", { name: "并发恢复", type: "doc" });
+await fs.writeFile(path.join(C.projectDir("acme-客户", "并发恢复"), "SPEC.md"), "# 旧 SPEC\n", "utf8");
+await C.appendConversation("acme-客户", "并发恢复", { role: "customer", at: "t0", text: "备份里的旧会话" });
+await C.snapshotWorkset("acme-客户", "并发恢复");
+await C.writeProjectState({ ...并发恢复, rounds: 1 });
+await fs.rm(C.projectDir("acme-客户", "并发恢复"), { recursive: true, force: true });
+// 模拟 chat：先恢复完并追加了新输入
+await C.ensureProjectWorkset("acme-客户", "并发恢复");
+await C.appendConversation("acme-客户", "并发恢复", { role: "customer", at: "t1", text: "chat 刚追加的新输入" });
+// 模拟稍慢的并发 GET：此刻才走到落盘
+await C.ensureProjectWorkset("acme-客户", "并发恢复");
+const conv7 = await C.readConversation("acme-客户", "并发恢复");
+ok("并发恢复没有把刚追加的输入盖掉", conv7.length === 2 && conv7[1].text === "chat 刚追加的新输入",
+  `len=${conv7.length} last=${conv7[conv7.length - 1]?.text}`);
+
+// —— 场景 14（Codex R2 Blocking#2）：备份标脏后，冷启不得把过期备份当成功恢复 ——
+const 脏备份 = await C.createProject("acme-客户", "脏备份", { name: "脏备份", type: "doc" });
+await fs.writeFile(path.join(C.projectDir("acme-客户", "脏备份"), "SPEC.md"), "# 第 1 轮\n", "utf8");
+await C.appendConversation("acme-客户", "脏备份", { role: "customer", at: "t", text: "第 1 轮会话" });
+await C.snapshotWorkset("acme-客户", "脏备份");
+// 第 2 轮跑完但备份失败 → 落账 + 标脏（备份里仍是第 1 轮的内容）
+await C.writeProjectState({ ...脏备份, rounds: 2, worksetBackupDirtyAt: "2026-08-02T04:00:00.000Z" });
+await fs.rm(C.projectDir("acme-客户", "脏备份"), { recursive: true, force: true });
+const ws13 = await C.ensureProjectWorkset("acme-客户", "脏备份");
+ok("备份已知过期 → lost 而非静默退回上一轮", ws13.kind === "lost" && !!ws13.staleSince, JSON.stringify(ws13));
+const ws14 = await C.ensureProjectWorkset("acme-客户", "脏备份", { acceptLoss: true });
+ok("acceptLoss 后仍恢复旧文档，但横幅点明是更早一轮", ws14.kind === "reset" && ws14.restoredDocs > 0, JSON.stringify(ws14));
+ok("横幅写明备份失败时刻", (await C.readDoc("acme-客户", "脏备份", "GAPS.md"))?.includes("最后一次备份失败于") === true);
+
+// —— 场景 15（Codex R2 High#3）：回滚到空会话必须把 count 归零，否则旧块复活 ——
+const 清空 = await C.createProject("acme-客户", "清空会话", { name: "清空", type: "doc" });
+await C.appendConversation("acme-客户", "清空会话", { role: "customer", at: "t", text: "失败轮的那条输入" });
+await C.truncateConversation("acme-客户", "清空会话", 0); // 回滚到空
+await C.writeProjectState({ ...清空, rounds: 0 });
+await fs.rm(C.projectDir("acme-客户", "清空会话"), { recursive: true, force: true });
+await C.ensureProjectWorkset("acme-客户", "清空会话");
+const conv8 = await C.readConversation("acme-客户", "清空会话");
+ok("清空后恢复不出已撤销的那条", conv8.length === 0, `len=${conv8.length}`);
+
 server.close();

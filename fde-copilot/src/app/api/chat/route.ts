@@ -77,13 +77,17 @@ async function runChatTurn(
   if (ws.kind === "lost") {
     return NextResponse.json(
       {
-        error:
-          `工作集已丢失：本项目在服务端有 ${ws.rounds} 轮历史，但容器重启后本地文档与会话没了，` +
-          `且没有可恢复的备份（该项目建于备份机制上线之前，或备份不完整）。继续对话会在空白上下文上重来，` +
-          `此前的会话不会回来。确认要继续，请带 acceptWorksetLoss: true 重发本请求（文档若有备份仍会恢复）；` +
-          `此前生成的文档也可到 git 交付仓库找回。`,
+        error: ws.staleSince
+          ? `工作集已丢失，且备份已过期：本项目有 ${ws.rounds} 轮历史，最后一次备份失败于 ${ws.staleSince}，` +
+            `store 里那份比现在落后至少一轮。直接恢复会把你悄悄退回更早的版本。确认接受，请带 ` +
+            `acceptWorksetLoss: true 重发（届时文档恢复到更早一轮，会话历史不恢复）。`
+          : `工作集已丢失：本项目在服务端有 ${ws.rounds} 轮历史，但容器重启后本地文档与会话没了，` +
+            `且没有可恢复的备份（该项目建于备份机制上线之前，或备份不完整）。继续对话会在空白上下文上重来，` +
+            `此前的会话不会回来。确认要继续，请带 acceptWorksetLoss: true 重发本请求（文档若有备份仍会恢复）；` +
+            `此前生成的文档也可到 git 交付仓库找回。`,
         code: "workset_lost",
         rounds: ws.rounds,
+        staleSince: ws.staleSince,
       },
       { status: 409 },
     );
