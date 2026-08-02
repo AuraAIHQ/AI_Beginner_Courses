@@ -65,6 +65,19 @@ clients/<slug>/
 
 前 7 个 `.md` 入库，就是喂给下游 loop 的 loop-ready 输入。
 
+### 持久化边界（生产 = CF Container，容器盘 ephemeral）
+
+配了 `WORKBENCH_STORE_URL` 时（生产默认），数据分两类落 Worker 侧 D1，容器经 `/_store/*` 读写：
+
+| 类别 | 内容 | 落库方式 |
+|---|---|---|
+| 持久数据模型 | `client.json` / `state.json`（含 usage） | 每次写立即入库，D1 即 source of truth |
+| 工作集 | 7 个 `.md` + `conversation.jsonl` | **读写走容器本地盘**（agent-sdk / git 直接操作），另每轮镜像一份备份进 D1（会话按 192KB 分块存多个 key）；容器重启后由 `ensureProjectWorkset()` 从备份写回盘 |
+
+关键约束：工作集的 source of truth 是**盘**，D1 里那份是备份。冷启动时若备份也没有（项目建于备份机制上线之前）而 `state.rounds > 0`，
+`ensureProjectWorkset()` 返回 `lost` —— **绝不铺空模板冒充恢复**，`/api/chat`、`/api/commit` 一律 409 报错，
+由用户显式确认（`acceptWorksetLoss: true`）才从空白重建，重建的模板顶部带丢失横幅，且该轮无条件不 commit/push。
+
 ## 下一版路线
 
 - 多模态输入落地：语音转写、PDF/Word/图片解析（v0 已留接口与占位）

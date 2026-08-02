@@ -279,15 +279,31 @@ export default function Workbench() {
     setDetail((d) =>
       d ? { ...d, conversation: [...d.conversation, { role: "customer", at: new Date().toISOString(), text }] } : d,
     );
-    try {
-      const r = await fetch("/api/chat", {
+    const post = (acceptWorksetLoss: boolean) =>
+      fetch("/api/chat", {
         method: "POST", headers: { "content-type": "application/json" },
-        body: JSON.stringify({ clientSlug: activeClient, projectSlug: activeProject, input: text }),
+        body: JSON.stringify({
+          clientSlug: activeClient, projectSlug: activeProject, input: text,
+          ...(acceptWorksetLoss ? { acceptWorksetLoss: true } : {}),
+        }),
       });
-      const j = await r.json();
+    try {
+      let r = await post(false);
+      let j = await r.json();
+      // CC-77：工作集丢失且无备份可恢复 → 服务端拒绝静默铺白板，必须由用户明确决定是否从空白重来。
+      if (r.status === 409 && j.code === "workset_lost") {
+        const goOn = window.confirm(
+          `${j.error}\n\n【确定】= 从空白重建（此前 ${j.rounds} 轮的文档与会话不会回来）\n【取消】= 先去 git 交付仓库找回内容`,
+        );
+        if (!goOn) { flash("已取消，未改动任何内容", true); return; }
+        r = await post(true);
+        j = await r.json();
+      }
       if (!r.ok) flash(j.error ?? "发送失败", true);
       else {
         const res = j.result as TurnResult;
+        if (j.workset?.kind === "restored") flash("容器曾重启，工作集已从备份恢复");
+        if (j.workset?.kind === "reset") flash(`工作集已丢失，本项目从空白重建（原第 ${j.workset.rounds} 轮）`, true);
         if (j.usedFallback) flash("未返回结构化结果，已用兜底文本", true);
         if (res.readiness.loop_ready) flash("🎉 规格已达 loop-ready！");
       }

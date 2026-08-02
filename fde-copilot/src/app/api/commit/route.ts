@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { readProjectState } from "@/lib/clients";
+import { readProjectState, ensureProjectWorkset } from "@/lib/clients";
 import { commitProject, assertAllowedPushHost } from "@/lib/git";
 import { authError } from "@/lib/auth";
 
@@ -28,6 +28,21 @@ export async function POST(req: Request) {
   }
   const state = await readProjectState(clientSlug, projectSlug);
   if (!state) return NextResponse.json({ error: "项目不存在" }, { status: 404 });
+  // CC-77：与 /api/chat 同一共享入口。冷启后盘丢了 → 先从备份恢复真内容再提交；
+  // 恢复不了绝不 acceptLoss —— 对一个空壳工作集 commit+push 会把空模板推上去覆盖已交付的 spec。
+  const ws = await ensureProjectWorkset(clientSlug, projectSlug);
+  if (ws.kind === "lost") {
+    return NextResponse.json(
+      {
+        error:
+          `工作集已丢失：本项目有 ${ws.rounds} 轮历史，但容器重启后本地文档没了且无备份可恢复。` +
+          `此时提交只会把空模板推上去、覆盖仓库里已交付的 spec，故拒绝。`,
+        code: "workset_lost",
+        rounds: ws.rounds,
+      },
+      { status: 409 },
+    );
+  }
   try {
     const r = await commitProject(
       clientSlug,

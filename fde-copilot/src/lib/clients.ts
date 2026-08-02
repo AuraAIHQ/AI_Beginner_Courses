@@ -55,11 +55,9 @@ async function exists(p: string): Promise<boolean> {
 // Worker 侧 D1（durable），容器经 HTTP shim（/_store/*，见 deploy/fde-copilot/src/index.ts）读写。
 // 未配 WORKBENCH_STORE_URL 时回落本地文件（本地开发行为与旧版完全一致）。
 //
-// 注意边界：SPEC_DOCS（SPEC.md 等生成文档）+ conversation.jsonl（会话）**不**入库 ——
-// 它们由 agent-sdk 直接写在 projectDir 工作目录、并由 git.ts push 交付，是「每会话工作集」，
-// 非持久数据模型；且把无界增长的会话拼进 D1 单个 TEXT 值会撞上限。故二者仍走文件系统
-// （readDoc/readAllDocs/appendConversation/readConversation + createProject 的 scaffold 写盘）。
-// usage/结算所需的 state.json.usage 已落 D1 → 已足以根治 /api/usage 404 卡结算。
+// 工作集（SPEC_DOCS + conversation.jsonl）**读写仍走文件系统** —— agent-sdk 直接读写 projectDir、
+// git.ts 从盘上取内容交付。但盘是 ephemeral，故另有一份**镜像备份**进同一 store（见下方
+// 「工作集备份」段），冷启动时写回盘。会话按行切块存多个 key，不会把无界增长的文本塞进单个 TEXT 值。
 // ─────────────────────────────────────────────────────────────────────────────
 interface MetaStore {
   read(key: string): Promise<string | null>;
@@ -144,6 +142,118 @@ const meta: MetaStore = (() => {
 const clientKey = (clientSlug: string) => `${clientSlug}/client.json`;
 const stateKey = (clientSlug: string, projectSlug: string) => `${clientSlug}/projects/${projectSlug}/state.json`;
 
+// ─────────────────────────────────────────────────────────────────────────────
+// CC-77 · 工作集备份（PR #85 二轮 review blocking）
+//
+// 上一版的「冷启动水合」用 docScaffold() 重铺 7 个空模板 —— 那不是恢复，是**伪造**：
+// 冷启后 D1 里 rounds=N，盘上却是白板，agent 在零上文下继续跑、rounds 继续往上加，
+// 用户收不到任何信号（先前那个 ENOENT 500 反而是唯一的探测器）。用一块看起来合理的白板
+// 换掉一次响亮的失败，在失败场景下严格更差。
+//
+// 本段是真备份/真恢复：
+//  · docs —— 每轮结束后整份镜像进 store（7 个 key，各自一份文档全文）
+//  · conversation —— 按行切成 ≤CONV_CHUNK_BYTES 的块存多个 key。切块是确定性的追加：
+//    满块此后不再变化，故每次追加只需重写最后一块（full=true 时才全量写）。
+// 不走「从 git remote 恢复」：AUTO_PUSH 默认 false（.env.example:28），大量项目根本没推过，
+// 那条路恢复不到东西；store 是唯一每轮都写得到的持久出口。
+//
+// 恢复不了的老项目（本次改动之前建的、store 里没有备份）→ 判 lost，**绝不铺模板**，
+// 由路由响亮报错交给用户决策（见 ensureProjectWorkset / WorksetState）。
+// ─────────────────────────────────────────────────────────────────────────────
+const CONV_CHUNK_BYTES = 192 * 1024; // D1 单值上限 2MB，UTF-8 多字节 + JSON 转义留足余量
+const worksetDocKey = (c: string, p: string, file: string) => `${c}/projects/${p}/workset/docs/${file}`;
+const worksetConvKey = (c: string, p: string, i: number) =>
+  `${c}/projects/${p}/workset/conv/${String(i).padStart(5, "0")}.jsonl`;
+
+/**
+ * 只有远端 store（生产 D1）才需要镜像：本地 FsMetaStore 的盘本身就是持久的，
+ * 镜像等于把同一份内容在 clients/ 里写两遍（还会被 commitProject 一起 add 进去）。
+ */
+const MIRROR_WORKSET = !!process.env.WORKBENCH_STORE_URL?.trim();
+
+/** 按行切块，每块 ≤ CONV_CHUNK_BYTES（单行超限时自成一块，不截断）。 */
+function chunkConversation(raw: string): string[] {
+  const lines = raw.split("\n").filter(Boolean).map((l) => l + "\n");
+  const out: string[] = [];
+  let cur = "";
+  let curBytes = 0;
+  for (const line of lines) {
+    const b = Buffer.byteLength(line, "utf8");
+    if (cur && curBytes + b > CONV_CHUNK_BYTES) {
+      out.push(cur);
+      cur = "";
+      curBytes = 0;
+    }
+    cur += line;
+    curBytes += b;
+  }
+  if (cur) out.push(cur);
+  return out;
+}
+
+/** 会话镜像。full=false 时只重写最后一块（满块内容不再变化，见上方说明）。 */
+async function backupConversation(clientSlug: string, projectSlug: string, full = false): Promise<void> {
+  if (!MIRROR_WORKSET) return;
+  let raw: string;
+  try {
+    raw = await fs.readFile(path.join(projectDir(clientSlug, projectSlug), "conversation.jsonl"), "utf8");
+  } catch {
+    return;
+  }
+  const chunks = chunkConversation(raw);
+  if (chunks.length === 0) return;
+  const from = full ? 0 : chunks.length - 1;
+  for (let i = from; i < chunks.length; i++) {
+    await meta.write(worksetConvKey(clientSlug, projectSlug, i), chunks[i]);
+  }
+}
+
+/**
+ * 文档镜像：把盘上现存的 SPEC_DOCS 整份写进 store。每轮对话结束调一次（文档由 agent 直接写盘，
+ * 拦不到单次写，故按轮快照）。盘上不存在的文档跳过 —— 不覆盖 store 里已有的备份。
+ */
+export async function snapshotWorkset(clientSlug: string, projectSlug: string): Promise<void> {
+  if (!MIRROR_WORKSET) return;
+  const dir = projectDir(clientSlug, projectSlug);
+  await Promise.all(
+    SPEC_DOCS.map(async (f) => {
+      let content: string;
+      try {
+        content = await fs.readFile(path.join(dir, f), "utf8");
+      } catch {
+        return;
+      }
+      await meta.write(worksetDocKey(clientSlug, projectSlug, f), content);
+    }),
+  );
+  await backupConversation(clientSlug, projectSlug, true);
+}
+
+/** 从 store 备份写回盘。docs/conv 分开计数 —— 会话没恢复出来 = agent 仍在零上文下跑，得单独判。 */
+async function restoreWorkset(
+  clientSlug: string,
+  projectSlug: string,
+  dir: string,
+): Promise<{ docs: number; conv: number }> {
+  if (!MIRROR_WORKSET) return { docs: 0, conv: 0 };
+  let docs = 0;
+  for (const f of SPEC_DOCS) {
+    const v = await meta.read(worksetDocKey(clientSlug, projectSlug, f));
+    if (v != null) {
+      await fs.writeFile(path.join(dir, f), v, "utf8");
+      docs++;
+    }
+  }
+  const parts: string[] = [];
+  for (let i = 0; ; i++) {
+    const v = await meta.read(worksetConvKey(clientSlug, projectSlug, i));
+    if (v == null) break;
+    parts.push(v);
+  }
+  if (parts.length > 0) await fs.writeFile(path.join(dir, "conversation.jsonl"), parts.join(""), "utf8");
+  return { docs, conv: parts.length };
+}
+
 // —— 客户 ——
 export async function listClients(): Promise<Client[]> {
   const out: Client[] = [];
@@ -179,17 +289,23 @@ export async function createClient(name: string, background: string): Promise<Cl
 }
 
 // —— 项目 ——
-function docScaffold(clientName: string, projectName: string, deliverable: Deliverable, now: string): Record<string, string> {
+function docScaffold(
+  clientName: string,
+  projectName: string,
+  deliverable: Deliverable,
+  now: string,
+  banner = "",
+): Record<string, string> {
   const head = (title: string, hint: string) =>
-    `# ${title}\n\n> 客户：${clientName} ｜ 项目：${projectName} ｜ 交付物：${deliverable.name}（${deliverable.type}）\n> ${hint}\n> 本文件由 FDE Copilot 随每轮对话自动维护。\n\n_（尚未开始，等待输入）_\n`;
+    `# ${title}\n${banner}\n> 客户：${clientName} ｜ 项目：${projectName} ｜ 交付物：${deliverable.name}（${deliverable.type}）\n> ${hint}\n> 本文件由 FDE Copilot 随每轮对话自动维护。\n\n_（尚未开始，等待输入）_\n`;
   return {
     "SPEC.md": head("需求规格 · Spec", "问题定义 / 目标 / 范围 / 成功指标 / 非目标"),
     "PRODUCT.md": head("产品描述 · Product", "一句话定位 / 目标用户 / 核心价值 / 关键场景"),
     "FEATURES.md": head("Feature 细节", "用户故事 + 验收标准 + 边界/异常 + 优先级"),
     "TECH_SPEC.md": head("技术方案 · Tech Spec", "架构 / 数据模型 / 接口 / 依赖 / 部署 / 风险"),
     "INTERACTIONS.md": head("交互流程与验收", "逐步交互 + 每步检查/验收标准"),
-    "GAPS.md": `# 缺口台账 · Gaps\n\n> 客户：${clientName} ｜ 项目：${projectName}\n\n## 待客户回答\n\n_（暂无）_\n\n## 调研假设·待确认\n\n_（暂无）_\n\n## 已关闭\n\n_（暂无）_\n`,
-    "INTAKE.md": `# 原始需求记录 · Intake\n\n> 客户：${clientName} ｜ 项目：${projectName}\n> 每轮原话/输入的累积摘要（只追加）。\n`,
+    "GAPS.md": `# 缺口台账 · Gaps\n${banner}\n> 客户：${clientName} ｜ 项目：${projectName}\n\n## 待客户回答\n\n_（暂无）_\n\n## 调研假设·待确认\n\n_（暂无）_\n\n## 已关闭\n\n_（暂无）_\n`,
+    "INTAKE.md": `# 原始需求记录 · Intake\n${banner}\n> 客户：${clientName} ｜ 项目：${projectName}\n> 每轮原话/输入的累积摘要（只追加）。\n`,
   };
 }
 
@@ -223,44 +339,103 @@ export async function createProject(clientSlug: string, name: string, deliverabl
   if (await meta.exists(stateKey(clientSlug, slug))) throw new Error(`项目「${slug}」已存在`);
   const now = new Date().toISOString();
   // 文档是「每会话工作集」：由 agent-sdk 直接读写 projectDir、git push 交付 → 仍落文件系统。
-  const dir = projectDir(clientSlug, slug);
-  await fs.mkdir(dir, { recursive: true });
-  const scaffold = docScaffold(client.name, name, deliverable, now.slice(0, 10));
-  await Promise.all(Object.entries(scaffold).map(([f, c]) => fs.writeFile(path.join(dir, f), c, "utf8")));
-  await fs.writeFile(path.join(dir, "conversation.jsonl"), "", "utf8");
+  await scaffoldWorkset(clientSlug, slug, client.name, name, deliverable, now);
   // 项目状态（含 usage）是持久数据模型 → 落 meta store（生产 = D1）。
   const state: ProjectState = {
     slug, clientSlug, name, deliverable,
     createdAt: now, updatedAt: now, rounds: 0, status: "intake", lastReadiness: null,
   };
   await writeProjectState(state);
+  await snapshotWorkset(clientSlug, slug); // 初始模板也进备份，冷启后能原样恢复
   return state;
 }
 
 /**
- * 冷启动水合（PR #85 review blocking）：CF 容器盘 ephemeral，重启后 D1 里仍有 client/state，
- * 但 projectDir 工作集（docs + conversation.jsonl）已随盘丢失。此时任何 fs 写（appendConversation /
- * agent-sdk 写 docs）落在缺失的父目录上会 ENOENT → /api/chat 500（且吃不到本轮 state.usage 更新，
- * 正是本 PR 想根治的「D1 有、盘没了」场景没兜住）。本函数在 fs 写之前把工作集补齐：确保 projectDir
- * 存在、缺失的 scaffold 文档 / 空 conversation.jsonl 重建。**幂等** —— 只补缺失文件，绝不覆盖已存在
- * 内容（避免抹掉本会话已生成的 SPEC 等）。无 state（项目真不存在）→ 直接返回，交调用方按 404 处理。
+ * **铺空模板** —— 只在「确知这个项目没有历史」时调用（新建项目，或用户显式确认从空白重建）。
+ * 与 ensureProjectWorkset 严格分开：这个函数有能力凭空造内容，所以调用点必须自己举证没有东西可丢。
+ * `{ flag: "wx" }` 保证只补缺失文件、绝不覆盖已存在内容（同时关掉 exists→writeFile 的 TOCTOU 窗口）。
  */
-export async function ensureProjectWorkset(clientSlug: string, projectSlug: string): Promise<void> {
-  const state = await readProjectState(clientSlug, projectSlug);
-  if (!state) return;
-  let dir: string;
-  try { dir = projectDir(clientSlug, projectSlug); } catch { return; }
+async function scaffoldWorkset(
+  clientSlug: string,
+  projectSlug: string,
+  clientName: string,
+  projectName: string,
+  deliverable: Deliverable,
+  createdAt: string,
+  banner = "",
+): Promise<void> {
+  const dir = projectDir(clientSlug, projectSlug);
   await fs.mkdir(dir, { recursive: true });
+  const scaffold = docScaffold(clientName, projectName, deliverable, createdAt.slice(0, 10), banner);
+  const writeIfAbsent = async (p: string, c: string) => {
+    try {
+      await fs.writeFile(p, c, { encoding: "utf8", flag: "wx" });
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
+    }
+  };
+  await Promise.all(Object.entries(scaffold).map(([f, c]) => writeIfAbsent(path.join(dir, f), c)));
+  await writeIfAbsent(path.join(dir, "conversation.jsonl"), "");
+}
+
+/**
+ * 工作集当前状态。`lost` 是唯一需要路由拦下来的分支：D1 说这个项目有历史，盘上没了，
+ * 备份里也没有 —— 此时任何「继续」都是在被抹掉的历史上继续，必须让用户知道。
+ */
+export type WorksetState =
+  | { kind: "present" }                       // 盘上完好
+  | { kind: "restored"; files: number }       // 冷启后从备份写回，内容真恢复了
+  | { kind: "fresh" }                         // 确无历史（rounds=0）→ 铺模板安全
+  | { kind: "reset"; rounds: number }         // 有历史且无法恢复，用户显式确认后从空白重建
+  | { kind: "lost"; rounds: number };         // 有历史且无法恢复，未获确认 → 调用方必须拒绝本次操作
+
+/**
+ * 冷启动水合（PR #85 review）：CF 容器盘 ephemeral，重启后 D1 里仍有 client/state，
+ * 但 projectDir 工作集（docs + conversation.jsonl）已随盘丢失 —— 任何 fs 写落在缺失父目录上会
+ * ENOENT 500，任何 fs 读会静默读到空。本函数是所有「从 D1 state 走到磁盘」的路由的共享入口。
+ *
+ * 顺序：盘上完好 → present；否则先从 store 备份恢复真内容 → restored；备份也没有时按有无历史分叉：
+ * rounds=0 → 铺模板（fresh，没有东西可丢）；rounds>0 → **不铺**，返回 lost 让路由响亮报错。
+ * 只有调用方带 acceptLoss（用户已明确知情）才铺带丢失横幅的空模板 → reset。
+ */
+export async function ensureProjectWorkset(
+  clientSlug: string,
+  projectSlug: string,
+  opts: { acceptLoss?: boolean } = {},
+): Promise<WorksetState> {
+  const state = await readProjectState(clientSlug, projectSlug);
+  if (!state) throw new Error("项目不存在"); // 调用方应先 readProjectState 走 404
+  const dir = projectDir(clientSlug, projectSlug); // slug 已由 readProjectState 的 assertSafe 把关
+
+  // conversation.jsonl 是工作集是否在盘上的判据：createProject / scaffoldWorkset / restoreWorkset
+  // 三条路径都会建它，且 agent 不会删它。
+  if (await exists(path.join(dir, "conversation.jsonl"))) return { kind: "present" };
+
+  await fs.mkdir(dir, { recursive: true });
+  const r = await restoreWorkset(clientSlug, projectSlug, dir);
+  // 会话必须一并恢复：rounds>0 却没恢复出会话，等于 agent 照样在零上文下继续跑（文档恢复了也一样），
+  // 与「全丢」同类，按 lost 处理，不做「恢复了一半」的乐观判定。
+  const convOk = state.rounds === 0 || r.conv > 0;
+  if (r.docs > 0 && convOk) {
+    // 备份恢复出的文档可能少于 7 个（某轮镜像失败）：补齐缺的空模板，不动恢复到的。
+    const client = await readClient(clientSlug);
+    await scaffoldWorkset(
+      clientSlug, projectSlug, client?.name ?? clientSlug, state.name, state.deliverable, state.createdAt,
+    );
+    return { kind: "restored", files: r.docs + r.conv };
+  }
+
+  if (state.rounds > 0 && !opts.acceptLoss) return { kind: "lost", rounds: state.rounds };
+
   const client = await readClient(clientSlug);
-  const scaffold = docScaffold(client?.name ?? clientSlug, state.name, state.deliverable, state.createdAt.slice(0, 10));
-  await Promise.all(
-    Object.entries(scaffold).map(async ([f, c]) => {
-      const p = path.join(dir, f);
-      if (!(await exists(p))) await fs.writeFile(p, c, "utf8");
-    }),
+  const banner =
+    state.rounds > 0
+      ? `\n> ⚠️ 工作集已随容器重启丢失（丢失时第 ${state.rounds} 轮），内容**未恢复**；以下为空模板重建。\n> 此前生成的文档请到 git 交付仓库找回。\n`
+      : "";
+  await scaffoldWorkset(
+    clientSlug, projectSlug, client?.name ?? clientSlug, state.name, state.deliverable, state.createdAt, banner,
   );
-  const conv = path.join(dir, "conversation.jsonl");
-  if (!(await exists(conv))) await fs.writeFile(conv, "", "utf8");
+  return state.rounds > 0 ? { kind: "reset", rounds: state.rounds } : { kind: "fresh" };
 }
 
 // —— 文档（挂在项目下，工作集，走文件系统）——
@@ -282,15 +457,13 @@ export async function readAllDocs(clientSlug: string, projectSlug: string): Prom
   return out;
 }
 
-// —— 会话（每会话工作集，走文件系统）——
-// 与 SPEC_DOCS 一致:conversation.jsonl 是「工作集」而非持久数据模型,故走 fs,不入 D1。
-// 这也避免把无界增长的会话拼进 D1 单个 TEXT 值撞上限(会让后续 append 恒抛)。
-// 持久数据模型 = client + project-state(含 usage),已落 meta store,足以修 /api/usage 404。
+// —— 会话（工作集：读写走文件系统，另有分块镜像备份进 store）——
 export async function appendConversation(clientSlug: string, projectSlug: string, entry: ConversationEntry): Promise<void> {
   const dir = projectDir(clientSlug, projectSlug);
   // 防御性:冷启后目录可能随 ephemeral 盘丢失,fs.appendFile 不建父目录 → 否则 ENOENT 500(见 ensureProjectWorkset)。
   await fs.mkdir(dir, { recursive: true });
   await fs.appendFile(path.join(dir, "conversation.jsonl"), JSON.stringify(entry) + "\n", "utf8");
+  await backupConversation(clientSlug, projectSlug);
 }
 
 export async function readConversation(clientSlug: string, projectSlug: string): Promise<ConversationEntry[]> {

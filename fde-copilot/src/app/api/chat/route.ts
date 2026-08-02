@@ -1,5 +1,11 @@
 import { NextResponse } from "next/server";
-import { readProjectState, writeProjectState, appendConversation, ensureProjectWorkset } from "@/lib/clients";
+import {
+  readProjectState,
+  writeProjectState,
+  appendConversation,
+  ensureProjectWorkset,
+  snapshotWorkset,
+} from "@/lib/clients";
 import { runTurn } from "@/lib/agent";
 import { commitProject, type CommitResult } from "@/lib/git";
 import { scopedAuthError, originError } from "@/lib/auth";
@@ -16,12 +22,14 @@ export async function POST(req: Request) {
   const oe = originError(req);
   if (oe) return oe;
 
-  const { clientSlug, projectSlug, input, attachments, lang } = (await req.json()) as {
+  const { clientSlug, projectSlug, input, attachments, lang, acceptWorksetLoss } = (await req.json()) as {
     clientSlug?: string;
     projectSlug?: string;
     input?: string;
     attachments?: string[];
     lang?: string; // CC-53：zh | en | th，缺省 zh；非法值归一到 zh
+    /** CC-77：工作集丢失且无备份时，用户确认「就从空白重来」的显式开关（见下方 409）。 */
+    acceptWorksetLoss?: boolean;
   };
 
   if (!clientSlug || !projectSlug || !input || !input.trim()) {
@@ -35,9 +43,25 @@ export async function POST(req: Request) {
   const state = await readProjectState(clientSlug, projectSlug);
   if (!state) return NextResponse.json({ error: "项目不存在" }, { status: 404 });
 
-  // 冷启动水合(review #85 blocking):D1 有 state 但容器盘丢了 projectDir → 补齐工作集,
+  // 冷启动水合(review #85):D1 有 state 但容器盘丢了 projectDir → 先从 store 备份恢复真内容,
   // 否则下面 appendConversation / runTurn 的 fs 写会 ENOENT 500(且吃不到 state.usage 更新)。
-  await ensureProjectWorkset(clientSlug, projectSlug);
+  // 恢复不了(老项目无备份)绝不静默铺白板 —— 那会让 agent 在零上文下继续跑、rounds 继续加在
+  // 已被抹掉的历史上,而用户毫无信号。此时响亮 409,由用户决定是否从空白重来。
+  const ws = await ensureProjectWorkset(clientSlug, projectSlug, { acceptLoss: acceptWorksetLoss === true });
+  if (ws.kind === "lost") {
+    return NextResponse.json(
+      {
+        error:
+          `工作集已丢失：本项目在服务端有 ${ws.rounds} 轮历史，但容器重启后本地文档与会话没了，` +
+          `且没有可恢复的备份（该项目建于备份机制上线之前）。继续对话会在完全空白的上下文上重来，` +
+          `此前的 SPEC / 会话不会回来。确认要从空白重建，请带 acceptWorksetLoss: true 重发本请求；` +
+          `此前生成的文档可到 git 交付仓库找回。`,
+        code: "workset_lost",
+        rounds: ws.rounds,
+      },
+      { status: 409 },
+    );
+  }
 
   const now = new Date().toISOString();
   await appendConversation(clientSlug, projectSlug, {
@@ -61,6 +85,9 @@ export async function POST(req: Request) {
     result: out.result,
   });
 
+  // 文档由 agent 直接写盘 → 轮末整份镜像进 store，下次冷启才恢复得出真内容（而非空模板）。
+  await snapshotWorkset(clientSlug, projectSlug);
+
   const nextStatus =
     out.result.readiness.loop_ready ? "ready" : state.status === "intake" ? "building" : state.status;
   await writeProjectState({
@@ -70,10 +97,15 @@ export async function POST(req: Request) {
     status: nextStatus,
     lastReadiness: out.result.readiness,
     usage: addUsage(state.usage ?? ZERO_USAGE, out.usage),
+    // 历史断点的唯一durable记录：rounds 连续累加，光看 rounds 看不出中间断过一次。
+    ...(ws.kind === "reset"
+      ? { worksetLostAt: new Date().toISOString(), worksetLostAtRound: ws.rounds }
+      : {}),
   });
 
   let commit: CommitResult | null = null;
-  if (process.env.AUTO_COMMIT === "true") {
+  // 从空白重建的这一轮无条件不 commit/push（不看 env）：盘上是空模板，推上去会覆盖仓库里已交付的 spec。
+  if (ws.kind !== "reset" && process.env.AUTO_COMMIT === "true") {
     try {
       commit = await commitProject(
         clientSlug,
@@ -90,6 +122,8 @@ export async function POST(req: Request) {
     result: out.result,
     usedFallback: out.usedFallback,
     commit,
+    // CC-77：工作集这轮是否发生过恢复/重建，供 UI 提示（present/fresh 时无需打扰用户）。
+    workset: ws.kind === "present" || ws.kind === "fresh" ? undefined : ws,
     // CC-54：回传本轮 chat 实际 token 成本(按价表算)供 hack5 积分扣费
     usage: {
       costUsd: out.usage.costUsd,
