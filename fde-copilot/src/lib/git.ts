@@ -63,7 +63,11 @@ export async function commitProject(
   const rel = path.relative(repoRoot(), projectDir(clientSlug, projectSlug));
   // CC-77：.workset-dirty 是本地盘的运行时状态标记（见 clients.ts LOCAL_DIRTY_MARK），
   // 不是交付内容 —— 排除掉，免得它进仓库，也免得「只有标记变了」被误判成有文档变更。
-  const noMark = `:(exclude)${rel.split(path.sep).join("/")}/.workset-dirty`;
+  const markPath = `${rel.split(path.sep).join("/")}/.workset-dirty`;
+  const noMark = `:(exclude)${markPath}`;
+  // :(exclude) 只管「本次不 stage」，管不了它之前是否已被外部 stage 过 —— 那种情况它会留在 index 里，
+  // 迟早被别的提交带走。开头显式 unstage 一次（未 staged / 空仓时是 no-op，失败无害）。
+  await git(["reset", "--quiet", "--", markPath]).catch(() => {});
   await git(["add", "--", rel, noMark]);
 
   // 无变更则跳过

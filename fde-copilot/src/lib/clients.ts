@@ -527,7 +527,8 @@ export type WorksetState =
  * 但 projectDir 工作集（docs + conversation.jsonl）已随盘丢失 —— 任何 fs 写落在缺失父目录上会
  * ENOENT 500，任何 fs 读会静默读到空。本函数是所有「从 D1 state 走到磁盘」的路由的共享入口。
  *
- * 顺序：盘上完好 → present；否则先从 store 备份恢复真内容 → restored；备份也没有时按有无历史分叉：
+ * 顺序：**先看 .workset-dirty 本地脏标记（优先于下面一切判定，含 rounds=0 和 acceptLoss）**；
+ * 再看盘上是否完好 → present；否则从 store 备份恢复真内容 → restored；备份也没有时按有无历史分叉：
  * rounds=0 → 铺模板（fresh，没有东西可丢）；rounds>0 → **不铺**，返回 lost 让路由响亮报错。
  * 只有调用方带 acceptLoss（用户已明确知情）才铺带丢失横幅的空模板 → reset。
  */
