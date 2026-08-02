@@ -639,16 +639,32 @@ export async function truncateConversation(
   projectSlug: string,
   size: number,
 ): Promise<{ ok: boolean; error?: string }> {
+  const convPath = path.join(projectDir(clientSlug, projectSlug), "conversation.jsonl");
   try {
-    await fs.truncate(path.join(projectDir(clientSlug, projectSlug), "conversation.jsonl"), size);
+    await fs.truncate(convPath, size);
+  } catch (e) {
+    // 本地截断失败 —— 盘上这份**仍含已撤销的孤儿输入**，而 present 判据只看文件在不在，
+    // 下一次请求会直接信任它继续跑（worksetBackupDirtyAt 只影响冷启恢复，管不到已存在的本地工作集）。
+    // 故把这份脏文件撤下来，逼下一次走恢复路径；配合调用方标脏，下一次是 lost（响亮），
+    // 不会变成「静默拿脏历史继续」。备份也无从回滚（它要靠本地文件重算），一并按失败上报。
+    const error = (e as Error).message;
+    console.error(`[workset] ${clientSlug}/${projectSlug} 本地会话回滚失败：${error}`);
+    if (MIRROR_WORKSET) {
+      // 仅在有备份兜底时才删：本地开发（FsMetaStore）没有备份，删了就是真丢。
+      await fs.rm(convPath, { force: true }).catch((e2) =>
+        console.error(`[workset] 撤下脏会话文件也失败：${(e2 as Error).message}`),
+      );
+    }
+    return { ok: false, error };
+  }
+  try {
     await backupConversation(clientSlug, projectSlug, true); // 全量重写,让备份跟着回滚(块数可能变少)
     return { ok: true };
   } catch (e) {
-    // **绝不静默**：增量备份很可能已经把这条输入写进 store 了，本地截断成功而备份回滚失败 =
-    // store 里留着一条已撤销的孤儿输入，且 state 还认为备份可信 → 冷启会把它当历史恢复回来。
-    // 失败必须回传给调用方去标 worksetBackupDirtyAt。
+    // 增量备份很可能已经把这条输入写进 store 了：本地截断成功而备份回滚失败 = store 里留着一条
+    // 已撤销的孤儿输入，且 state 还认为备份可信 → 冷启会把它当历史恢复回来。必须回传去标脏。
     const error = (e as Error).message;
-    console.error(`[workset] ${clientSlug}/${projectSlug} 会话回滚失败：${error}`);
+    console.error(`[workset] ${clientSlug}/${projectSlug} 会话备份回滚失败：${error}`);
     return { ok: false, error };
   }
 }

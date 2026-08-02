@@ -270,4 +270,19 @@ await fs.rm(C.projectDir("acme-客户", "回滚失败"), { recursive: true, forc
 const ws15 = await C.ensureProjectWorkset("acme-客户", "回滚失败");
 ok("标脏后不会把孤儿输入当历史恢复", ws15.kind === "lost", JSON.stringify(ws15));
 
+// —— 场景 17（Codex R4 Blocking）：本地截断失败时，脏会话文件必须被撤下 ——
+//    否则 present 判据（文件存在）照样通过，下一次请求直接拿含孤儿输入的本地历史继续跑，
+//    而 worksetBackupDirtyAt 只管冷启恢复、管不到已存在的本地工作集。
+const 本地失败 = await C.createProject("acme-客户", "本地截断失败", { name: "本地失败", type: "doc" });
+const 本地失败Path = path.join(C.projectDir("acme-客户", "本地截断失败"), "conversation.jsonl");
+await C.appendConversation("acme-客户", "本地截断失败", { role: "customer", at: "t", text: "孤儿输入" });
+await fs.chmod(本地失败Path, 0o444); // 文件只读 → truncate 报 EACCES（模拟本地写失败）
+const r1 = await C.truncateConversation("acme-客户", "本地截断失败", 0);
+ok("本地截断失败会如实回传", r1.ok === false, JSON.stringify(r1));
+ok("脏会话文件已被撤下（下次必然重走恢复而非信任脏历史）",
+  !(await fs.access(本地失败Path).then(() => true).catch(() => false)));
+await C.writeProjectState({ ...本地失败, rounds: 1, worksetBackupDirtyAt: new Date(0).toISOString() });
+const ws16 = await C.ensureProjectWorkset("acme-客户", "本地截断失败");
+ok("下一次请求判 lost 而非静默继续", ws16.kind === "lost", JSON.stringify(ws16));
+
 server.close();
