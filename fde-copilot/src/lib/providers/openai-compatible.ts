@@ -39,6 +39,13 @@ export interface ToolLoopResult {
   text: string;
   usage: { inputTokens: number; outputTokens: number };
   turns: number;
+  /**
+   * true = 用满 maxTurns 仍未收到「不带 tool_calls 的收尾回复」。
+   * 此时**不抛错**：模型很可能已经通过 submit_turn 交出了有效结果，只是没再多说一句收尾的话；
+   * 抛错会把它连同已写盘的文档一起丢掉，违反本文件既有的「provider 失败要优雅降级，不要抛」约定。
+   * 由调用方决定这算不算失败（lmstudio.ts：submit_turn 收到了就照常返回，没收到才算 fallback）。
+   */
+  exhausted: boolean;
 }
 
 export interface RunToolLoopOptions {
@@ -112,7 +119,7 @@ export async function runToolLoop(opts: RunToolLoopOptions): Promise<ToolLoopRes
     });
 
     if (!calls.length) {
-      return { text: message.content ?? "", usage, turns: turn };
+      return { text: message.content ?? "", usage, turns: turn, exhausted: false };
     }
 
     for (const call of calls) {
@@ -132,5 +139,13 @@ export async function runToolLoop(opts: RunToolLoopOptions): Promise<ToolLoopRes
     }
   }
 
-  throw new Error(`OpenAI-compatible agent 超过最大工具回合数 ${maxTurns}`);
+  // 用满回合数 → 如实上报，但不抛：见 ToolLoopResult.exhausted。
+  // 最后一条 assistant 文本（可能为空）照常带回，调用方能据此给用户一个有内容的回复。
+  const last = [...messages].reverse().find((m) => m.role === "assistant");
+  return {
+    text: typeof last?.content === "string" ? last.content : "",
+    usage,
+    turns: maxTurns,
+    exhausted: true,
+  };
 }

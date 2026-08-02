@@ -40,13 +40,20 @@ pnpm dev                    # http://localhost:3939
 
 ```bash
 cd fde-copilot
+cp .env.docker.example .env.docker   # 按需改；compose 通过 env_file 注入容器（该文件已 gitignore）
 docker compose up --build -d
 docker compose exec fde-copilot claude auth login --claudeai
 ```
 
 访问 `http://localhost:3939`。可用 `docker compose exec fde-copilot claude auth status` 检查登录状态。客户规格与会话状态会持久化在宿主机的 `clients/`；改端口可执行 `FDE_COPILOT_PORT=8080 docker compose up -d`。
 
-如果要公网暴露，请在反向代理层做 HTTPS 与认证。`WORKBENCH_TOKEN` 会要求每个 API 请求包含 `x-workbench-token`，当前网页不会自动附带该 header，因此不要只靠设置这个变量来保护公网入口。
+### 暴露范围（默认只绑回环）
+
+compose 默认把端口绑在 `127.0.0.1`。**不配 `WORKBENCH_TOKEN` 时鉴权是 fail-open 的** —— 谁能连上端口，谁就能读写全部客户 spec。所以：
+
+- 本机单人用：保持默认即可。
+- 要让局域网其他机器访问：必须**同时**在 `.env.docker` 里设 `WORKBENCH_TOKEN`，再设 `FDE_COPILOT_BIND=0.0.0.0`。只做后者等于把所有客户资料对同网段敞开。
+- 公网暴露：在反向代理层做 HTTPS 与认证。注意当前网页不会自动附带 `x-workbench-token`，因此不要只靠这个变量保护公网入口 —— 它挡得住脚本，挡不住「代理没配好」。
 
 ## 安全模型
 

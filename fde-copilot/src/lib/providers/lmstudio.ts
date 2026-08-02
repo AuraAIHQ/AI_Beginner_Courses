@@ -23,6 +23,10 @@ const TurnResultSchema = z.object({
     missing: z.array(z.string()),
   }),
   updated_docs: z.array(z.string()),
+  // 快 chat（fastMode）：prompt 明确要求模型把「更新后的 SPEC.md 全文」放这里，由 server 写盘。
+  // 此前 schema 里没有这个字段 —— zod 非 strict 会静默 strip，模型照做也等于白写，
+  // 而这条正是默认路径（CHAT_FULL_SPEC 未设时 fastMode=true）。
+  spec_markdown: z.string().optional(),
 });
 
 const fileEnum = [...SPEC_DOCS];
@@ -103,6 +107,11 @@ const tools: FunctionTool[] = [
             required: ["score", "loop_ready", "missing"],
           },
           updated_docs: { type: "array", items: { type: "string", enum: fileEnum } },
+          spec_markdown: {
+            type: "string",
+            description:
+              "快 chat 模式下：更新后的 SPEC.md 全文，由 server 写盘（此模式下不要用 write_spec）。",
+          },
         },
         required: ["reply", "open_questions", "research_notes", "readiness", "updated_docs"],
         additionalProperties: false,
@@ -171,16 +180,35 @@ export async function runLmStudioSpecAgent(
     inputTokens: loop.usage.inputTokens,
     outputTokens: loop.usage.outputTokens,
     computeMs: Date.now() - started,
-    turns: 1,
+    turns: loop.turns, // 此前硬编码 1，把真实回合数丢了（计费/遥测按轮统计时会少算）
   };
-  if (submitted) return { result: submitted, usedFallback: false, rawText: loop.text, usage };
+  if (submitted) {
+    // 快 chat：模型没有用 write_spec，而是把全文放进 spec_markdown —— server 负责写盘。
+    // 与 claude 路径（agent.ts 的同名处理）行为对齐；缺了它，prompt 的承诺在本 provider 上是空的。
+    const spec = (submitted as TurnResult).spec_markdown;
+    if (typeof spec === "string" && spec.trim()) {
+      const body = spec.endsWith("\n") ? spec : spec + "\n";
+      await fs.writeFile(await safeSpec(opts.root, "SPEC.md"), body, "utf8");
+      const docs = (submitted as TurnResult).updated_docs;
+      if (!docs.includes("SPEC.md")) docs.push("SPEC.md");
+    }
+    return { result: submitted, usedFallback: false, rawText: loop.text, usage };
+  }
 
   return {
     result: {
-      reply: loop.text || "本地模型未提交结构化结果，请重试。",
+      reply:
+        loop.text ||
+        (loop.exhausted
+          ? `本地模型用满 ${loop.turns} 个工具回合仍未提交结果。可调大 AGENT_MAX_TURNS 后重试。`
+          : "本地模型未提交结构化结果，请重试。"),
       open_questions: [],
       research_notes: [],
-      readiness: { score: 0, loop_ready: false, missing: ["本地模型未调用 submit_turn"] },
+      readiness: {
+        score: 0,
+        loop_ready: false,
+        missing: [loop.exhausted ? `工具回合用尽（${loop.turns}）且未调用 submit_turn` : "本地模型未调用 submit_turn"],
+      },
       updated_docs: [],
     },
     usedFallback: true,

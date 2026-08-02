@@ -2,7 +2,17 @@ services:
   fde-copilot:
     build: .
     ports:
-      - "${FDE_COPILOT_PORT:-3939}:3939"
+      # 默认只绑回环。容器里跑的是「未配 token 时未认证即可读写全部客户 spec」的服务
+      # （authError()/originError() 在没有 WORKBENCH_TOKEN 时 fail-open），发布到 0.0.0.0
+      # 等于把所有客户资料对同网段敞开。要暴露到局域网必须**显式**设 FDE_COPILOT_BIND=0.0.0.0，
+      # 并同时在 .env.docker 里配好 WORKBENCH_TOKEN。
+      - "${FDE_COPILOT_BIND:-127.0.0.1}:${FDE_COPILOT_PORT:-3939}:3939"
+    # .env.docker 的键必须真的注入容器。此前只有 environment: 里显式列出的那几个能进去，
+    # 而 .env.docker.example 记录的 WORKBENCH_TOKEN / AGENT_MAX_TURNS / AUTO_COMMIT 全部到不了
+    # ——文档推荐的那条缓解措施（设 WORKBENCH_TOKEN）实际是空操作。required:false 保证没有该文件也能起。
+    env_file:
+      - path: .env.docker
+        required: false
     environment:
       NODE_ENV: production
       # Persistent browser-login state used by the bundled Claude Agent SDK.

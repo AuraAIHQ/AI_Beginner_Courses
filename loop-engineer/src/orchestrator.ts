@@ -12,7 +12,7 @@ import type { ResolvedProvider } from "./config.js";
  * 跳过，从首个可解析的兜底档起，与 planner 的降级链对称。
  * 返回 null = 一个可用 provider 都没有（凭证全缺）→ 调用方按 task-failed 处理。
  */
-function resolveReviewerChain(
+export function resolveReviewerChain(
   primaryName: string,
 ): { provider: ResolvedProvider; fallbacks: ResolvedProvider[] } | null {
   let primary: ResolvedProvider | null = null;
@@ -21,8 +21,12 @@ function resolveReviewerChain(
   } catch {
     primary = null; // 主 provider 不可用（如 workers-ai 缺 CF 凭证）→ 走兜底链
   }
-  // agentic reviewer（非 openai-chat）：无 chat 兜底链，单 provider 直用（能解析才有）
-  if (primary && primary.kind !== "openai-chat") {
+  // agentic reviewer：无 chat 兜底链，单 provider 直用（能解析才有）。
+  // 判据必须是 capabilities.contextAccess，不能是 kind —— 本 PR 把 HiLinkup 的 kind 从 "openai-chat"
+  // 改成了 "openai-compatible"，若还按 kind 判，HiLinkup 会掉进这个分支拿到空 fallbacks，
+  // 等于静默删掉上一个 PR 专为 HiLinkup 429/额度耗尽加的 reviewer 降级链。
+  // 同一文件 :238 与 feedback.ts:66 都已经用 contextAccess 判，这里是唯一漏改的调用点。
+  if (primary && primary.capabilities.contextAccess === "agentic") {
     return { provider: primary, fallbacks: [] };
   }
   // openai-chat（或主档不可用）：主档 + 角色兜底链，逐档跳过不可解析的

@@ -8,6 +8,7 @@ import type { CanUseTool } from "@anthropic-ai/claude-agent-sdk";
 import { ZERO_USAGE } from "./types";
 import { resolveProviderSelection } from "./providers/registry";
 import { specAgentProvider } from "./providers/spec-provider";
+import { safeProjectPath } from "./providers/path-policy";
 
 /**
  * 执行模式（CC-58，与 loop-engineer 对齐）：`api`（默认，云 key）| `local`（显式 opt-in，
@@ -65,10 +66,22 @@ function resolveAgentEnv(): Record<string, string | undefined> {
  */
 function makeCanUseTool(root: string): CanUseTool {
   const base = path.resolve(root);
-  const inside = (p: unknown): boolean => {
-    if (typeof p !== "string" || p.length === 0) return false;
-    const abs = path.isAbsolute(p) ? path.resolve(p) : path.resolve(base, p);
-    return abs === base || abs.startsWith(base + path.sep);
+  /**
+   * 返回拒绝原因，通过则返回 null。
+   *
+   * 走 providers/path-policy 的 safeProjectPath —— 此前这里是纯词法检查（resolve + startsWith），
+   * 不解析符号链接：客户目录里放一个指向 /etc 的软链，词法上完全"在目录内"，照样能读写出去。
+   * 结果是本 PR 新加的 LM Studio 路径反而比这条 live 的 Claude 路径更严，属于倒挂。两条路径现在
+   * 共用同一份策略（拒绝符号链接 + 校验 realpath + 逐级校验父目录），加固一处两边都生效。
+   */
+  const outsideReason = async (p: unknown): Promise<string | null> => {
+    if (typeof p !== "string" || p.length === 0) return "缺少路径参数";
+    try {
+      await safeProjectPath(base, p);
+      return null;
+    } catch (e) {
+      return (e as Error).message;
+    }
   };
   const PATH_KEY: Record<string, string> = {
     Read: "file_path",
@@ -94,13 +107,15 @@ function makeCanUseTool(root: string): CanUseTool {
     }
     if (toolName in PATH_KEY) {
       const p = (input as Record<string, unknown>)[PATH_KEY[toolName]];
-      if (!inside(p)) return { behavior: "deny", message: `拒绝越界路径：${String(p)}（仅允许客户目录内）` };
+      const denied = await outsideReason(p);
+      if (denied) return { behavior: "deny", message: `拒绝越界路径：${String(p)}（${denied}）` };
       return { behavior: "allow", updatedInput: input };
     }
     if (toolName === "Glob" || toolName === "Grep") {
       const p = (input as Record<string, unknown>).path;
-      if (p !== undefined && !inside(p)) {
-        return { behavior: "deny", message: `拒绝越界搜索路径：${String(p)}` };
+      if (p !== undefined) {
+        const denied = await outsideReason(p);
+        if (denied) return { behavior: "deny", message: `拒绝越界搜索路径：${String(p)}（${denied}）` };
       }
       return { behavior: "allow", updatedInput: input };
     }
@@ -418,12 +433,16 @@ export async function runTurn(input: RunTurnInput): Promise<RunTurnOutput> {
     specContent = await fs.readFile(path.join(dir, "SPEC.md"), "utf8").catch(() => "");
   }
 
+  // 工具名按 provider 取：claude 走 MCP（带前缀），LM Studio 走原生 function calling（无前缀）。
+  // 写死 mcp__ 前缀会让本地模型找不到这个工具。
+  const submitTool =
+    selection.provider === "lmstudio" ? "submit_turn" : "mcp__workbench__submit_turn";
   const taskBlock = fastMode
     ? `## 当前 SPEC.md 全文（就是下面这段，你要在此基础上更新；不要用任何文件工具，全靠这段做增量）
 ${specContent ? "```markdown\n" + specContent + "\n```" : "（SPEC.md 尚为空，请写一份精简初稿）"}
 
 ## 你的任务（快 chat 单次调用）
-结合**客户背景**、**交付物目标**、**最近对话**，把客户本轮新输入并进 SPEC.md。**你没有文件读写工具**——把更新后的**完整 SPEC.md 全文**放进 \`mcp__workbench__submit_turn\` 的 \`spec_markdown\` 字段（server 会替你写盘），同时给出简短 reply、最关键的问题、readiness。**只调用 submit_turn 恰好一次，这是你唯一的动作。**`
+结合**客户背景**、**交付物目标**、**最近对话**，把客户本轮新输入并进 SPEC.md。**本轮不要用文件读写工具**——把更新后的**完整 SPEC.md 全文**放进 \`${submitTool}\` 的 \`spec_markdown\` 字段（server 会替你写盘），同时给出简短 reply、最关键的问题、readiness。**只调用 ${submitTool} 恰好一次，这是你唯一的动作。**`
     : `## 你的任务
 按 system prompt 的流程处理这轮输入：结合上面的**客户背景**与**交付物目标**，读现状 → 融合更新当前目录下的 spec 文档 → 检缺口 → 能查的自己查、只有客户知道的抛问题 → 评估 readiness → 最后调用 mcp__workbench__submit_turn 恰好一次。`;
 
@@ -441,7 +460,9 @@ ${taskBlock}`;
 
   // LM Studio（OURS 多provider）：走 provider 抽象层（本地 OpenAI 兼容 agentic 生成 spec）。
   if (selection.provider === "lmstudio") {
-    const lmMaxTurns = Number(process.env.AGENT_MAX_TURNS ?? (fastMode ? 4 : 40));
+    // fastMode 下 claude 只需 1 次工具调用，4 轮够；但本地模型常先 read_spec/list_specs 探一下再
+    // submit_turn，read→write→submit 正好把 4 轮吃干净、连收尾回复都排不上。给本地路径抬到 8。
+    const lmMaxTurns = Number(process.env.AGENT_MAX_TURNS ?? (fastMode ? 8 : 40));
     return specAgentProvider(selection).run({
       root: dir,
       system,
