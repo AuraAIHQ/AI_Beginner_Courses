@@ -237,6 +237,32 @@ export async function createProject(clientSlug: string, name: string, deliverabl
   return state;
 }
 
+/**
+ * 冷启动水合（PR #85 review blocking）：CF 容器盘 ephemeral，重启后 D1 里仍有 client/state，
+ * 但 projectDir 工作集（docs + conversation.jsonl）已随盘丢失。此时任何 fs 写（appendConversation /
+ * agent-sdk 写 docs）落在缺失的父目录上会 ENOENT → /api/chat 500（且吃不到本轮 state.usage 更新，
+ * 正是本 PR 想根治的「D1 有、盘没了」场景没兜住）。本函数在 fs 写之前把工作集补齐：确保 projectDir
+ * 存在、缺失的 scaffold 文档 / 空 conversation.jsonl 重建。**幂等** —— 只补缺失文件，绝不覆盖已存在
+ * 内容（避免抹掉本会话已生成的 SPEC 等）。无 state（项目真不存在）→ 直接返回，交调用方按 404 处理。
+ */
+export async function ensureProjectWorkset(clientSlug: string, projectSlug: string): Promise<void> {
+  const state = await readProjectState(clientSlug, projectSlug);
+  if (!state) return;
+  let dir: string;
+  try { dir = projectDir(clientSlug, projectSlug); } catch { return; }
+  await fs.mkdir(dir, { recursive: true });
+  const client = await readClient(clientSlug);
+  const scaffold = docScaffold(client?.name ?? clientSlug, state.name, state.deliverable, state.createdAt.slice(0, 10));
+  await Promise.all(
+    Object.entries(scaffold).map(async ([f, c]) => {
+      const p = path.join(dir, f);
+      if (!(await exists(p))) await fs.writeFile(p, c, "utf8");
+    }),
+  );
+  const conv = path.join(dir, "conversation.jsonl");
+  if (!(await exists(conv))) await fs.writeFile(conv, "", "utf8");
+}
+
 // —— 文档（挂在项目下，工作集，走文件系统）——
 export async function readDoc(clientSlug: string, projectSlug: string, file: string): Promise<string | null> {
   if (!SPEC_DOCS.includes(file as never)) return null;
@@ -261,8 +287,10 @@ export async function readAllDocs(clientSlug: string, projectSlug: string): Prom
 // 这也避免把无界增长的会话拼进 D1 单个 TEXT 值撞上限(会让后续 append 恒抛)。
 // 持久数据模型 = client + project-state(含 usage),已落 meta store,足以修 /api/usage 404。
 export async function appendConversation(clientSlug: string, projectSlug: string, entry: ConversationEntry): Promise<void> {
-  const p = path.join(projectDir(clientSlug, projectSlug), "conversation.jsonl");
-  await fs.appendFile(p, JSON.stringify(entry) + "\n", "utf8");
+  const dir = projectDir(clientSlug, projectSlug);
+  // 防御性:冷启后目录可能随 ephemeral 盘丢失,fs.appendFile 不建父目录 → 否则 ENOENT 500(见 ensureProjectWorkset)。
+  await fs.mkdir(dir, { recursive: true });
+  await fs.appendFile(path.join(dir, "conversation.jsonl"), JSON.stringify(entry) + "\n", "utf8");
 }
 
 export async function readConversation(clientSlug: string, projectSlug: string): Promise<ConversationEntry[]> {

@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { readProjectState, writeProjectState, appendConversation } from "@/lib/clients";
+import { readProjectState, writeProjectState, appendConversation, ensureProjectWorkset } from "@/lib/clients";
 import { runTurn } from "@/lib/agent";
 import { commitProject, type CommitResult } from "@/lib/git";
 import { scopedAuthError, originError } from "@/lib/auth";
@@ -34,6 +34,10 @@ export async function POST(req: Request) {
 
   const state = await readProjectState(clientSlug, projectSlug);
   if (!state) return NextResponse.json({ error: "项目不存在" }, { status: 404 });
+
+  // 冷启动水合(review #85 blocking):D1 有 state 但容器盘丢了 projectDir → 补齐工作集,
+  // 否则下面 appendConversation / runTurn 的 fs 写会 ENOENT 500(且吃不到 state.usage 更新)。
+  await ensureProjectWorkset(clientSlug, projectSlug);
 
   const now = new Date().toISOString();
   await appendConversation(clientSlug, projectSlug, {
