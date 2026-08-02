@@ -548,14 +548,16 @@ export async function ensureProjectWorkset(
   if (await exists(dirtyMark)) {
     // 再试一次清理（上次失败可能是瞬时的）：只有备份兜得住才敢删本地那份。
     const cleaned = MIRROR_WORKSET && (await fs.rm(convPath, { force: true }).then(() => true, () => false));
-    if (cleaned || state.rounds === 0) {
-      await fs.rm(dirtyMark, { force: true }).catch(() => {});
-      if (!cleaned) return { kind: "present" }; // rounds=0：没有历史可丢，脏也无所谓
-    } else {
-      // 仍清不掉 → 响亮报错，绝不静默沿用脏历史。**这里不看 acceptLoss**：用户就算同意从头来，
-      // 我们也交付不出干净状态（脏文件删不掉，scaffold 的 wx 不会覆盖它），只能等磁盘故障排除。
+    if (!cleaned) {
+      // 清不掉就一律拦下，**不看 rounds、也不看 acceptLoss**：
+      // - 不看 rounds —— rounds=0 时风险不是「丢历史」而是「沿用一条已明确撤销的输入」，同样不可接受；
+      //   而且此时若放行并删掉标记，等磁盘故障恢复后下一次就直接命中 present，脏输入永久留在历史里。
+      // - 不看 acceptLoss —— 用户就算同意从头来，我们也交付不出干净状态（脏文件删不掉，
+      //   scaffold 的 wx 不会覆盖它）。只能等容器重启（盘重建）或磁盘故障排除。
+      // 标记也一并保留，不删。
       return { kind: "lost", rounds: state.rounds, localDirty: true };
     }
+    await fs.rm(dirtyMark, { force: true }).catch(() => {});
   }
 
   // conversation.jsonl 是工作集是否在盘上的判据：createProject / scaffoldWorkset / restoreWorkset

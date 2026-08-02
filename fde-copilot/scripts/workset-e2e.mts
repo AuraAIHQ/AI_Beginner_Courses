@@ -312,4 +312,22 @@ await fs.chmod(删不掉Path, 0o644);
 const ws18 = await C.ensureProjectWorkset("acme-客户", "删不掉");
 ok("磁盘恢复后自愈（不再 localDirty）", ws18.kind !== "lost" || !ws18.localDirty, JSON.stringify(ws18));
 
+// —— 场景 19（Codex R6 Blocking）：rounds=0 也不得放行脏文件 ——
+//    风险不是「丢历史」而是「沿用一条已明确撤销的输入」；放行还会顺手删掉标记，
+//    等磁盘恢复后下一次直接命中 present，脏输入就永久留在历史里了。
+const 新项目脏 = await C.createProject("acme-客户", "新项目脏", { name: "新项目脏", type: "doc" });
+const 新项目脏Path = path.join(C.projectDir("acme-客户", "新项目脏"), "conversation.jsonl");
+await C.appendConversation("acme-客户", "新项目脏", { role: "customer", at: "t", text: "首轮就失败的输入" });
+await fs.chmod(新项目脏Path, 0o444);
+(fs as { rm: unknown }).rm = async () => {
+  throw new Error("EPERM: mock 删除失败");
+};
+await C.truncateConversation("acme-客户", "新项目脏", 0);
+const ws19 = await C.ensureProjectWorkset("acme-客户", "新项目脏");
+(fs as { rm: unknown }).rm = origRm;
+ok("rounds=0 且脏文件清不掉 → 仍 lost(不放行)", ws19.kind === "lost" && ws19.localDirty === true,
+  `${JSON.stringify(ws19)} rounds=${新项目脏.rounds}`);
+ok("拦下时标记必须保留（否则磁盘恢复后会静默 present）",
+  await fs.access(path.join(C.projectDir("acme-客户", "新项目脏"), ".workset-dirty")).then(() => true).catch(() => false));
+
 server.close();

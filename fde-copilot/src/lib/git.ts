@@ -61,10 +61,13 @@ export async function commitProject(
   }
 
   const rel = path.relative(repoRoot(), projectDir(clientSlug, projectSlug));
-  await git(["add", "--", rel]);
+  // CC-77：.workset-dirty 是本地盘的运行时状态标记（见 clients.ts LOCAL_DIRTY_MARK），
+  // 不是交付内容 —— 排除掉，免得它进仓库，也免得「只有标记变了」被误判成有文档变更。
+  const noMark = `:(exclude)${rel.split(path.sep).join("/")}/.workset-dirty`;
+  await git(["add", "--", rel, noMark]);
 
   // 无变更则跳过
-  const status = await git(["status", "--porcelain", "--", rel]);
+  const status = await git(["status", "--porcelain", "--", rel, noMark]);
   if (!status) {
     return { committed: false, pushed: false, detail: "无文档变更，跳过提交" };
   }
@@ -77,6 +80,7 @@ export async function commitProject(
     "Claude-Session: https://claude.ai/code/session_01Auxf6v5qsq3sNYjDP5qcnX",
     "--",
     rel,
+    noMark,
   ]);
 
   let pushed = false;
