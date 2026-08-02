@@ -491,6 +491,22 @@ async function scaffoldWorkset(
 }
 
 /**
+ * 「本地工作集已知含脏数据」标记。放盘上而非 D1：脏的是这块 ephemeral 盘上的文件，
+ * 容器重启后盘和标记一起消失，正是我们要的语义（重启后本地本来就没有脏数据了）。
+ * 必须在 present 判据**之前**被检查，否则 conversation.jsonl 还在时会先命中 present 绕过一切判定。
+ */
+const LOCAL_DIRTY_MARK = ".workset-dirty";
+
+async function markLocalDirty(clientSlug: string, projectSlug: string, reason: string): Promise<void> {
+  try {
+    const dir = projectDir(clientSlug, projectSlug);
+    await fs.writeFile(path.join(dir, LOCAL_DIRTY_MARK), `${new Date().toISOString()}\n${reason}\n`, "utf8");
+  } catch (e) {
+    console.error(`[workset] ${clientSlug}/${projectSlug} 写本地脏标记失败：${(e as Error).message}`);
+  }
+}
+
+/**
  * 工作集当前状态。`lost` 是唯一需要路由拦下来的分支：D1 说这个项目有历史，盘上没了，
  * 备份里也没有 —— 此时任何「继续」都是在被抹掉的历史上继续，必须让用户知道。
  */
@@ -503,7 +519,8 @@ export type WorksetState =
   | { kind: "reset"; rounds: number; restoredDocs: number }
   // 有历史且无法恢复，未获确认 → 调用方必须拒绝本次操作。
   // staleSince 非空 = 备份**存在但已知过期**（上次备份失败的时刻），恢复它会把用户退回更早一轮。
-  | { kind: "lost"; rounds: number; staleSince?: string };
+  // localDirty = 盘上那份已知含已撤销的脏数据且清理不掉（磁盘故障），比「没有」更危险。
+  | { kind: "lost"; rounds: number; staleSince?: string; localDirty?: boolean };
 
 /**
  * 冷启动水合（PR #85 review）：CF 容器盘 ephemeral，重启后 D1 里仍有 client/state，
@@ -523,9 +540,27 @@ export async function ensureProjectWorkset(
   if (!state) throw new Error("项目不存在"); // 调用方应先 readProjectState 走 404
   const dir = projectDir(clientSlug, projectSlug); // slug 已由 readProjectState 的 assertSafe 把关
 
+  const convPath = path.join(dir, "conversation.jsonl");
+
+  // 本地脏标记必须抢在 present 之前：失败轮回滚时本地截断失败、脏文件又删不掉，盘上那份就含着
+  // 一条已撤销的输入 —— 此时 conversation.jsonl 明明存在，但绝不能判 present 拿它继续跑。
+  const dirtyMark = path.join(dir, LOCAL_DIRTY_MARK);
+  if (await exists(dirtyMark)) {
+    // 再试一次清理（上次失败可能是瞬时的）：只有备份兜得住才敢删本地那份。
+    const cleaned = MIRROR_WORKSET && (await fs.rm(convPath, { force: true }).then(() => true, () => false));
+    if (cleaned || state.rounds === 0) {
+      await fs.rm(dirtyMark, { force: true }).catch(() => {});
+      if (!cleaned) return { kind: "present" }; // rounds=0：没有历史可丢，脏也无所谓
+    } else {
+      // 仍清不掉 → 响亮报错，绝不静默沿用脏历史。**这里不看 acceptLoss**：用户就算同意从头来，
+      // 我们也交付不出干净状态（脏文件删不掉，scaffold 的 wx 不会覆盖它），只能等磁盘故障排除。
+      return { kind: "lost", rounds: state.rounds, localDirty: true };
+    }
+  }
+
   // conversation.jsonl 是工作集是否在盘上的判据：createProject / scaffoldWorkset / restoreWorkset
   // 三条路径都会建它，且 agent 不会删它。
-  if (await exists(path.join(dir, "conversation.jsonl"))) return { kind: "present" };
+  if (await exists(convPath)) return { kind: "present" };
 
   const backup = await readWorksetBackup(clientSlug, projectSlug);
   const docCount = Object.keys(backup.docs).length;
@@ -645,16 +680,26 @@ export async function truncateConversation(
   } catch (e) {
     // 本地截断失败 —— 盘上这份**仍含已撤销的孤儿输入**，而 present 判据只看文件在不在，
     // 下一次请求会直接信任它继续跑（worksetBackupDirtyAt 只影响冷启恢复，管不到已存在的本地工作集）。
-    // 故把这份脏文件撤下来，逼下一次走恢复路径；配合调用方标脏，下一次是 lost（响亮），
-    // 不会变成「静默拿脏历史继续」。备份也无从回滚（它要靠本地文件重算），一并按失败上报。
+    // 故把这份脏文件撤下来，逼下一次走恢复路径。备份也无从回滚（它要靠本地文件重算），一并按失败上报。
     const error = (e as Error).message;
     console.error(`[workset] ${clientSlug}/${projectSlug} 本地会话回滚失败：${error}`);
+    let removed = false;
     if (MIRROR_WORKSET) {
       // 仅在有备份兜底时才删：本地开发（FsMetaStore）没有备份，删了就是真丢。
-      await fs.rm(convPath, { force: true }).catch((e2) =>
-        console.error(`[workset] 撤下脏会话文件也失败：${(e2 as Error).message}`),
+      removed = await fs.rm(convPath, { force: true }).then(
+        () => true,
+        (e2) => {
+          console.error(`[workset] 撤下脏会话文件也失败：${(e2 as Error).message}`);
+          return false;
+        },
       );
     }
+    // 删不掉（或没删）时必须留下标记：否则下一次 ensureProjectWorkset 会先命中 present、
+    // 完全绕过 dirty 判定，退回「静默拿脏历史继续」。标记落在**盘上**而不是 D1 —— 脏的是这块
+    // ephemeral 盘，容器一重启脏和标记一起消失，语义天然对齐，也不用在这条路径上写 D1。
+    // 限界：若整个目录不可写（连标记都写不下），那么下一次的 appendConversation 同样会失败 →
+    // 请求整体报错，仍然不会出现「静默用脏历史跑完一轮」。
+    if (!removed) await markLocalDirty(clientSlug, projectSlug, error);
     return { ok: false, error };
   }
   try {

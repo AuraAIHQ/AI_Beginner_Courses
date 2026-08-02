@@ -285,4 +285,31 @@ await C.writeProjectState({ ...本地失败, rounds: 1, worksetBackupDirtyAt: ne
 const ws16 = await C.ensureProjectWorkset("acme-客户", "本地截断失败");
 ok("下一次请求判 lost 而非静默继续", ws16.kind === "lost", JSON.stringify(ws16));
 
+// —— 场景 18（Codex R5 Blocking）：脏文件连删都删不掉时，必须留标记拦在 present 之前 ——
+const 删不掉 = await C.createProject("acme-客户", "删不掉", { name: "删不掉", type: "doc" });
+const 删不掉Path = path.join(C.projectDir("acme-客户", "删不掉"), "conversation.jsonl");
+await C.appendConversation("acme-客户", "删不掉", { role: "customer", at: "t", text: "删不掉的孤儿输入" });
+await C.writeProjectState({ ...删不掉, rounds: 3 });
+await fs.chmod(删不掉Path, 0o444); // 本地 truncate 失败
+const origRm = fs.rm;
+(fs as { rm: unknown }).rm = async () => {
+  throw new Error("EPERM: mock 删除失败");
+}; // 撤下脏文件也失败
+const r2 = await C.truncateConversation("acme-客户", "删不掉", 0);
+(fs as { rm: unknown }).rm = origRm;
+ok("truncate 与 rm 双失败时如实回传", r2.ok === false, JSON.stringify(r2));
+ok("留下了本地脏标记", await fs.access(path.join(C.projectDir("acme-客户", "删不掉"), ".workset-dirty")).then(() => true).catch(() => false));
+// 关键：conversation.jsonl 还在，旧逻辑会命中 present 静默继续
+ok("脏文件确实还在（present 判据本会命中）", await fs.access(删不掉Path).then(() => true).catch(() => false));
+(fs as { rm: unknown }).rm = async () => {
+  throw new Error("EPERM: mock 删除失败");
+};
+const ws17 = await C.ensureProjectWorkset("acme-客户", "删不掉");
+(fs as { rm: unknown }).rm = origRm;
+ok("脏标记拦在 present 之前 → lost(localDirty)", ws17.kind === "lost" && ws17.localDirty === true, JSON.stringify(ws17));
+// 磁盘恢复后（rm 可用）自愈：清掉脏文件与标记，回到正常恢复路径
+await fs.chmod(删不掉Path, 0o644);
+const ws18 = await C.ensureProjectWorkset("acme-客户", "删不掉");
+ok("磁盘恢复后自愈（不再 localDirty）", ws18.kind !== "lost" || !ws18.localDirty, JSON.stringify(ws18));
+
 server.close();
