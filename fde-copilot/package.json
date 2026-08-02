@@ -9,6 +9,7 @@
     "build": "next build",
     "start": "next start -H 127.0.0.1 -p 3939",
     "typecheck": "tsc --noEmit",
+    "test:workset": "tsx scripts/workset-e2e.mts",
     "lint": "next lint"
   },
   "dependencies": {
@@ -22,6 +23,7 @@
     "@types/node": "^22.10.7",
     "@types/react": "^19.0.7",
     "@types/react-dom": "^19.0.3",
+    "tsx": "^4.23.1",
     "typescript": "^5.7.3"
   }
 }

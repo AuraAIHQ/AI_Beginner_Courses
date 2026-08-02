@@ -1,7 +1,7 @@
 // 冷启动水合 E2E（CC-77 / PR #85）：内存版 /_store（模拟 D1）+ 真实 fs + 临时 cwd，
 // 验证「丢盘 → 恢复真内容」「无备份 → lost 且绝不铺白板」「acceptLoss → 带横幅重建」「会话分块跨块恢复」。
 //
-//   跑法：pnpm --dir fde-copilot dlx tsx scripts/workset-e2e.mts
+//   跑法：pnpm --dir fde-copilot test:workset
 //   （必须 .mts —— 顶层 await；不碰用户数据，全在 os.tmpdir() 里）
 import http from "node:http";
 import { promises as fs } from "node:fs";
@@ -9,10 +9,15 @@ import path from "node:path";
 import os from "node:os";
 
 const kv = new Map<string, string>();
+let storeDown = false; // 置 true 模拟 store 不可用（用于验证备份失败路径）
 const server = http.createServer((req, res) => {
   let body = "";
   req.on("data", (c) => (body += c));
   req.on("end", () => {
+    if (storeDown) {
+      res.statusCode = 503;
+      return res.end(JSON.stringify({ error: "store down" }));
+    }
     const op = (req.url || "").slice("/_store/".length);
     const b = JSON.parse(body || "{}");
     const send = (o: unknown) => res.end(JSON.stringify(o));
@@ -251,5 +256,18 @@ await fs.rm(C.projectDir("acme-客户", "清空会话"), { recursive: true, forc
 await C.ensureProjectWorkset("acme-客户", "清空会话");
 const conv8 = await C.readConversation("acme-客户", "清空会话");
 ok("清空后恢复不出已撤销的那条", conv8.length === 0, `len=${conv8.length}`);
+
+// —— 场景 16（Codex R3 Blocking）：回滚时备份写失败必须回传，让调用方标脏 ——
+const 回滚失败 = await C.createProject("acme-客户", "回滚失败", { name: "回滚失败", type: "doc" });
+await C.appendConversation("acme-客户", "回滚失败", { role: "customer", at: "t", text: "会被撤销的输入" });
+storeDown = true; // 模拟 store 挂掉：本地截断成功，但备份回滚写不进去
+const rolled = await C.truncateConversation("acme-客户", "回滚失败", 0);
+storeDown = false;
+ok("回滚时备份失败会如实回传（不吞掉）", rolled.ok === false && !!rolled.error, JSON.stringify(rolled));
+// 调用方据此标脏后，冷启不得再信任这份仍含孤儿输入的备份
+await C.writeProjectState({ ...回滚失败, rounds: 1, worksetBackupDirtyAt: new Date(0).toISOString() });
+await fs.rm(C.projectDir("acme-客户", "回滚失败"), { recursive: true, force: true });
+const ws15 = await C.ensureProjectWorkset("acme-客户", "回滚失败");
+ok("标脏后不会把孤儿输入当历史恢复", ws15.kind === "lost", JSON.stringify(ws15));
 
 server.close();

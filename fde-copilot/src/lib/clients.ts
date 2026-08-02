@@ -634,12 +634,22 @@ export async function conversationSize(clientSlug: string, projectSlug: string):
  * 两条一模一样的输入（agent 下一轮还会把这段脏历史当上下文）。调用方必须持有项目锁 —— 否则
  * 会截掉别的并发请求刚追加的内容。
  */
-export async function truncateConversation(clientSlug: string, projectSlug: string, size: number): Promise<void> {
+export async function truncateConversation(
+  clientSlug: string,
+  projectSlug: string,
+  size: number,
+): Promise<{ ok: boolean; error?: string }> {
   try {
     await fs.truncate(path.join(projectDir(clientSlug, projectSlug), "conversation.jsonl"), size);
     await backupConversation(clientSlug, projectSlug, true); // 全量重写,让备份跟着回滚(块数可能变少)
+    return { ok: true };
   } catch (e) {
-    console.error(`[workset] ${clientSlug}/${projectSlug} 会话回滚失败：${(e as Error).message}`);
+    // **绝不静默**：增量备份很可能已经把这条输入写进 store 了，本地截断成功而备份回滚失败 =
+    // store 里留着一条已撤销的孤儿输入，且 state 还认为备份可信 → 冷启会把它当历史恢复回来。
+    // 失败必须回传给调用方去标 worksetBackupDirtyAt。
+    const error = (e as Error).message;
+    console.error(`[workset] ${clientSlug}/${projectSlug} 会话回滚失败：${error}`);
+    return { ok: false, error };
   }
 }
 

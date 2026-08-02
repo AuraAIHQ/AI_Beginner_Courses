@@ -108,7 +108,16 @@ async function runChatTurn(
   try {
     out = await runTurn({ clientSlug, projectSlug, customerInput: input, attachments, lang: normLang(lang) });
   } catch (e) {
-    await truncateConversation(clientSlug, projectSlug, rollbackTo);
+    const rolled = await truncateConversation(clientSlug, projectSlug, rollbackTo);
+    if (!rolled.ok) {
+      // 本地回滚了但备份没跟上：store 里还留着这条已撤销的输入，而 state 仍认为备份可信 →
+      // 容器重启后会被当成历史恢复回来。标脏，让 ensureProjectWorkset 拒绝信任这份备份。
+      try {
+        await writeProjectState({ ...state, worksetBackupDirtyAt: new Date().toISOString() });
+      } catch (e2) {
+        console.error(`[workset] ${clientSlug}/${projectSlug} 标脏也失败：${(e2 as Error).message}`);
+      }
+    }
     return NextResponse.json({ error: `agent 执行失败：${(e as Error).message}` }, { status: 500 });
   }
 
