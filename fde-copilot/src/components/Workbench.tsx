@@ -116,6 +116,12 @@ export default function Workbench() {
       phases?: JobPhase[];
     } | null
   >(null);
+  // PR#85 正确修法:登录 session cookie。authed=null(未知/加载中)/true/false。
+  const [authed, setAuthed] = useState<boolean | null>(null);
+  const [loginEnabled, setLoginEnabled] = useState(true);
+  const [pw, setPw] = useState("");
+  const [loginErr, setLoginErr] = useState<string | null>(null);
+  const [loggingIn, setLoggingIn] = useState(false);
   const t = STR[lang];
   const chatEndRef = useRef<HTMLDivElement>(null);
   // 工作台切换条 URL（部署时用 NEXT_PUBLIC_WB_*_URL 覆盖为你的域名）
@@ -131,8 +137,45 @@ export default function Workbench() {
     setTimeout(() => setToast(null), 4000);
   };
 
+  const checkAuth = useCallback(async () => {
+    try {
+      const r = await fetch("/api/login");
+      if (r.ok) {
+        const j = (await r.json()) as { authed?: boolean; loginEnabled?: boolean };
+        setLoginEnabled(j.loginEnabled !== false);
+        setAuthed(!!j.authed);
+        return;
+      }
+    } catch { /* ignore */ }
+    setAuthed(false);
+  }, []);
+
+  const doLogin = useCallback(async () => {
+    setLoginErr(null);
+    setLoggingIn(true);
+    try {
+      const r = await fetch("/api/login", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ password: pw }),
+      });
+      if (r.ok) {
+        setPw("");
+        setAuthed(true);
+      } else {
+        const j = (await r.json().catch(() => ({}))) as { error?: string };
+        setLoginErr(j.error || (lang === "en" ? "Login failed" : "登录失败"));
+      }
+    } catch {
+      setLoginErr(lang === "en" ? "Network error" : "网络错误");
+    } finally {
+      setLoggingIn(false);
+    }
+  }, [pw, lang]);
+
   const loadClients = useCallback(async () => {
     const r = await fetch("/api/clients");
+    if (r.status === 401) { setAuthed(false); return; }
     const j = await r.json();
     setClients(j.clients ?? []);
   }, []);
@@ -158,15 +201,20 @@ export default function Workbench() {
   }, []);
 
   useEffect(() => {
-    loadClients();
-    loadUsage();
-    const t2 = setInterval(loadUsage, 180_000);
+    checkAuth();
     if (typeof window !== "undefined") {
       const l = localStorage.getItem("fde:lang");
       if (l === "en" || l === "zh") setLang(l);
     }
+  }, [checkAuth]);
+
+  useEffect(() => {
+    if (authed !== true) return;
+    loadClients();
+    loadUsage();
+    const t2 = setInterval(loadUsage, 180_000);
     return () => clearInterval(t2);
-  }, [loadClients, loadUsage]);
+  }, [authed, loadClients, loadUsage]);
 
   useEffect(() => {
     if (activeClient && activeProject) loadDetail(activeClient, activeProject);
@@ -231,15 +279,39 @@ export default function Workbench() {
     setDetail((d) =>
       d ? { ...d, conversation: [...d.conversation, { role: "customer", at: new Date().toISOString(), text }] } : d,
     );
-    try {
-      const r = await fetch("/api/chat", {
+    const post = (acceptWorksetLoss: boolean) =>
+      fetch("/api/chat", {
         method: "POST", headers: { "content-type": "application/json" },
-        body: JSON.stringify({ clientSlug: activeClient, projectSlug: activeProject, input: text }),
+        body: JSON.stringify({
+          clientSlug: activeClient, projectSlug: activeProject, input: text,
+          ...(acceptWorksetLoss ? { acceptWorksetLoss: true } : {}),
+        }),
       });
-      const j = await r.json();
+    try {
+      let r = await post(false);
+      let j = await r.json();
+      // CC-77：工作集丢失且无备份可恢复 → 服务端拒绝静默铺白板，必须由用户明确决定是否从空白重来。
+      if (r.status === 409 && j.code === "workset_lost") {
+        const goOn = window.confirm(
+          `${j.error}\n\n【确定】= 从空白重建（此前 ${j.rounds} 轮的文档与会话不会回来）\n【取消】= 先去 git 交付仓库找回内容`,
+        );
+        if (!goOn) { flash("已取消，未改动任何内容", true); return; }
+        r = await post(true);
+        j = await r.json();
+      }
       if (!r.ok) flash(j.error ?? "发送失败", true);
       else {
         const res = j.result as TurnResult;
+        if (j.workset?.kind === "restored") flash("容器曾重启，工作集已从备份恢复");
+        if (j.workset?.kind === "reset")
+          flash(
+            j.workset.restoredDocs > 0
+              ? `会话历史已丢失（原第 ${j.workset.rounds} 轮），文档已从备份恢复`
+              : `工作集已丢失，本项目从空白重建（原第 ${j.workset.rounds} 轮）`,
+            true,
+          );
+        // 这轮结果保住了，但备份没写成 —— 容器再重启就真丢，必须让用户看见。
+        if (j.worksetBackupFailed) flash(`⚠️ 本轮备份失败，容器重启将丢失：${j.worksetBackupFailed}`, true);
         if (j.usedFallback) flash("未返回结构化结果，已用兜底文本", true);
         if (res.readiness.loop_ready) flash("🎉 规格已达 loop-ready！");
       }
@@ -345,6 +417,48 @@ export default function Workbench() {
   const readiness = detail?.state.lastReadiness;
   const dlvLabel = (type: string) =>
     DELIVERABLE_TYPES.find((d) => d.id === type)?.[lang === "zh" ? "label" : "labelEn"] ?? type;
+
+  // PR#85:未登录 → 只渲染登录门,不加载/暴露任何数据。authed=null 时先给个占位避免闪烁。
+  if (authed !== true) {
+    return (
+      <div className="shell" style={{ display: "flex", alignItems: "center", justifyContent: "center", minHeight: "100vh" }}>
+        {authed === null ? (
+          <div style={{ opacity: 0.6 }}>…</div>
+        ) : (
+          <div style={{ width: "min(360px, 90vw)", padding: 28, border: "1px solid rgba(128,128,128,.3)", borderRadius: 12 }}>
+            <h2 style={{ margin: "0 0 4px" }}>FDE Copilot</h2>
+            <p style={{ margin: "0 0 18px", opacity: 0.7, fontSize: 13 }}>
+              {lang === "en" ? "Console login" : "控制台登录"}
+            </p>
+            {loginEnabled ? (
+              <form
+                onSubmit={(e) => { e.preventDefault(); if (!loggingIn && pw) doLogin(); }}
+              >
+                <input
+                  type="password"
+                  autoFocus
+                  value={pw}
+                  onChange={(e) => setPw(e.target.value)}
+                  placeholder={lang === "en" ? "Password" : "密码"}
+                  style={{ width: "100%", padding: "10px 12px", boxSizing: "border-box", marginBottom: 12, borderRadius: 8, border: "1px solid rgba(128,128,128,.4)", background: "transparent", color: "inherit" }}
+                />
+                {loginErr && <div style={{ color: "#e5484d", fontSize: 13, marginBottom: 10 }}>{loginErr}</div>}
+                <button type="submit" className="primary" disabled={loggingIn || !pw} style={{ width: "100%", padding: "10px 12px", borderRadius: 8 }}>
+                  {loggingIn ? "…" : lang === "en" ? "Sign in" : "登录"}
+                </button>
+              </form>
+            ) : (
+              <p style={{ color: "#e5484d", fontSize: 13 }}>
+                {lang === "en"
+                  ? "Console login is not configured (WORKBENCH_UI_PASSWORD not set)."
+                  : "控制台登录未启用（服务端未配置 WORKBENCH_UI_PASSWORD）。"}
+              </p>
+            )}
+          </div>
+        )}
+      </div>
+    );
+  }
 
   return (
     <div className="shell">

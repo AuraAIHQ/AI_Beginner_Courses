@@ -98,6 +98,17 @@ export interface ProjectState {
   status: "intake" | "building" | "testing" | "ready";
   lastReadiness: Readiness | null;
   usage?: Usage;
+  /**
+   * CC-77：工作集曾随容器重启丢失、且无备份可恢复，用户确认后从空白重建的时刻。
+   * rounds 是连续累加的，这两个字段是历史断点的唯一记录 —— 别删，UI/结算据此解释「第 N 轮」的断层。
+   */
+  worksetLostAt?: string;
+  worksetLostAtRound?: number;
+  /**
+   * CC-77：最近一次工作集备份失败的时刻（备份失败不阻断本轮，但绝不能假装备份还在）。
+   * 非空 = 这个项目当前**没有**可信备份，容器再重启就会真丢；下一轮备份成功即清空。
+   */
+  worksetBackupDirtyAt?: string;
 }
 
 export const SPEC_DOCS = [

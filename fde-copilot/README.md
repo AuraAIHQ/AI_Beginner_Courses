@@ -65,6 +65,24 @@ clients/<slug>/
 
 前 7 个 `.md` 入库，就是喂给下游 loop 的 loop-ready 输入。
 
+### 持久化边界（生产 = CF Container，容器盘 ephemeral）
+
+配了 `WORKBENCH_STORE_URL` 时（生产默认），数据分两类落 Worker 侧 D1，容器经 `/_store/*` 读写：
+
+| 类别 | 内容 | 落库方式 |
+|---|---|---|
+| 持久数据模型 | `client.json` / `state.json`（含 usage） | 每次写立即入库，D1 即 source of truth |
+| 工作集 | 7 个 `.md` + `conversation.jsonl` | **读写走容器本地盘**（agent-sdk / git 直接操作），另镜像一份备份进 D1：文档每轮末全量快照，会话按 192KB 分块存多个 key + 一个 `conv/count`；容器重启后由 `ensureProjectWorkset()` 从备份写回盘 |
+
+工作集的 source of truth 是**盘**，D1 里那份是备份。恢复协议的几条硬规则：
+
+- **提交点是 `conv/count`**，写序为「先写块、后写 count」。恢复严格按 count 读 0..n-1，任一块缺失或拼出的 JSONL 有坏行 → 整份判不可恢复，**不截断**（把前缀当完整历史 = 把「丢了一半」伪装成恢复成功）。MetaStore 没有 delete，靠 count 变小来覆盖 reset 前的旧残块，避免旧尾巴拼到新会话后面。
+- **恢复是先读进内存、判定通过才落盘**，判定失败时盘上一个字节都不落。`conversation.jsonl` 是 present 的判据也是落盘的最后一步 —— 否则半成品会让下一次调用把 `lost` 误判成 `present`，409 静默退化。
+- 备份也没有（项目建于本机制上线前、或备份不完整）而 `state.rounds > 0` → `lost`：**绝不铺空模板冒充恢复**，`/api/chat`、`/api/commit` 一律 409；用户显式确认（`acceptWorksetLoss: true`）才继续，此时文档若有备份仍照常恢复真内容（丢的只是会话），凭空重建的空模板顶部带丢失横幅，且该轮无条件不 commit/push。
+- **备份是 best-effort，不阻断当轮**：轮内增量备份失败只记日志（轮末全量补写自愈），轮末全量备份失败则先保证 `rounds`/`usage` 落账，再把 `state.worksetBackupDirtyAt` 标脏并在响应里告警 —— 不阻断，但也绝不假装备份还在。
+- 单条会话 entry 超过 1MB 时，**备份里**替换为带说明的占位（盘上仍是原文），避免一条超长消息让整个项目从此备份不上。
+- 同一项目的 `/api/chat`、`/api/commit` 走进程内 `withProjectLock` 串行（`rounds`/`usage` 是 read-modify-write，并发会丢轮次和漏账）。**这把锁只在单实例部署下成立**；将来横向扩容必须换 Durable Object 或 D1 上的 CAS。
+
 ## 下一版路线
 
 - 多模态输入落地：语音转写、PDF/Word/图片解析（v0 已留接口与占位）

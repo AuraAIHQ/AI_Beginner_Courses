@@ -20,6 +20,15 @@
       { "name": "FDE_COPILOT", "class_name": "FdeCopilotContainer" }
     ]
   },
+  // CC-77 · 持久元数据存储（client/project-state/conversation）。容器盘 ephemeral，
+  // 数据模型落 D1，容器经 /_store/* HTTP shim 读写 → 跨容器重启存活，修 /api/usage 404。
+  "d1_databases": [
+    {
+      "binding": "FDE_STORE",
+      "database_name": "workbench-fde-store",
+      "database_id": "6f6ab200-c157-443e-a94b-11bee66958b7"
+    }
+  ],
   "migrations": [
     { "tag": "v1", "new_sqlite_classes": ["FdeCopilotContainer"] }
   ],
